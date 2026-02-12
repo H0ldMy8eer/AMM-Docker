@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+
+  products:
+    build:
+      context: ./products
+      dockerfile: Dockerfile
+    volumes:
+      - ../test_monolith_shop/products:/app/products
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - app-network
+
+
+  users:
+    build:
+      context: ./users
+      dockerfile: Dockerfile
+    volumes:
+      - ../test_monolith_shop/users:/app/users
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - app-network
+
+
+  orders:
+    build:
+      context: ./orders
+      dockerfile: Dockerfile
+    volumes:
+      - ../test_monolith_shop/orders:/app/orders
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - app-network
+
+
+
+networks:
+  app-network:
+    driver: bridge

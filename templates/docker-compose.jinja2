@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+{% for service in services %}
+  {{ service.name }}:
+    build:
+      context: ./{{ service.name }}
+      dockerfile: Dockerfile
+    volumes:
+      - ../test_monolith_shop/{{ service.path }}:/app/{{ service.name }}
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - app-network
+
+{% endfor %}
+
+networks:
+  app-network:
+    driver: bridge
