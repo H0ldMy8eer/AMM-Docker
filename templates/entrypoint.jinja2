@@ -1,30 +1,69 @@
-
-from flask import Flask
-from {{ service_name }}.routes import {{ service_name }}_bp
+import sys
 import os
+import inspect
+from flask import Flask, Blueprint
 
-# Импортируем общую базу данных (файл db.py, который мы скопировали)
+# Добавляем путь (фикс NameError)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from db import db
 
 app = Flask(__name__)
 
-# --- Конфигурация ---
-# Используем SQLite файл внутри контейнера
-basedir = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'database.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'dev-key-for-migration'
+# --- АВТОМАТИЧЕСКИЙ ПОИСК BLUEPRINT ---
+# Мы не знаем, назвал юзер переменную 'user_bp', 'users_bp' или 'bp'.
+# Поэтому мы импортируем модуль и ищем в нем объект Blueprint.
 
-# Инициализация БД
+service_name = "{{ service_name }}"
+service_bp = None
+
+# Попытка 1: Ищем в routes.py
+try:
+    import importlib
+    # Пробуем импортировать модуль (например, users.routes)
+    module = importlib.import_module(f"{service_name}.routes")
+except ImportError:
+    # Попытка 2: Ищем в views.py (для старых версий)
+    try:
+        module = importlib.import_module(f"{service_name}.views")
+    except ImportError as e:
+        print(f"CRITICAL: Could not find 'routes.py' or 'views.py' in {service_name}")
+        raise e
+
+# Перебираем все переменные в модуле и ищем Blueprint
+for name, obj in inspect.getmembers(module):
+    if isinstance(obj, Blueprint):
+        service_bp = obj
+        print(f"✅ Found Blueprint: {name}")
+        break
+
+if not service_bp:
+    raise Exception(f"❌ No Blueprint found in {service_name}. Please define 'bp = Blueprint(...)'")
+
+# --- КОНФИГУРАЦИЯ ---
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, f'{service_name}.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SERVICES_URLS'] = {{ services_map }}
+
 db.init_app(app)
 
-# Регистрация ТОЛЬКО одного блюпринта
-app.register_blueprint({{ service_name }}_bp, url_prefix='/{{ service_name }}')
+# --- РЕГИСТРАЦИЯ МОСТА ---
+try:
+    from api_bridge import api_bp
+    app.register_blueprint(api_bp, url_prefix='/internal')
+except Exception as e:
+    print(f"Warning: API Bridge skipped: {e}")
+
+# --- РЕГИСТРАЦИЯ ОСНОВНОГО СЕРВИСА ---
+app.register_blueprint(service_bp, url_prefix=f'/{service_name}')
+
+with app.app_context():
+    db.create_all()
 
 @app.route('/health')
 def health():
-    return {"status": "ok", "service": "{{ service_name }}"}
+    return {"status": "ok", "service": service_name}
 
 if __name__ == '__main__':
-    # Запуск на порту 5000 внутри контейнера
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True)

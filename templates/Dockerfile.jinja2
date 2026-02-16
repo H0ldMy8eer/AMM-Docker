@@ -1,21 +1,20 @@
-FROM python:3.9-slim
+FROM python:3.10-slim
+
+# Отключаем буферизацию (логи сразу в консоль)
+ENV PYTHONUNBUFFERED=1
+# Добавляем корень в PYTHONPATH, чтобы Python видел папки как модули
+ENV PYTHONPATH=/app
 
 WORKDIR /app
 
-# Установка зависимостей
-COPY global_requirements.txt .
-RUN pip install --no-cache-dir -r global_requirements.txt
-
-{% if local_requirements %}
+# 1. Зависимости (сначала, для кэша Docker)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-{% endif %}
 
-# Копирование кода сервиса
+# 2. Код приложения
 COPY . .
 
-# Открываем порт
+# 3. Порт и Запуск
 EXPOSE 5000
-
-# --- ИЗМЕНЕНИЕ: Запускаем сгенерированный entrypoint ---
-CMD ["python", "entrypoint.py"]
+# Запускаем наш новый run.py (бывший entrypoint)
+CMD ["python", "run.py"]

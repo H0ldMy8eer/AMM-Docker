@@ -3,106 +3,169 @@ import shutil
 from jinja2 import Environment, FileSystemLoader
 import scanner
 
-def render_dockerfile(module_info, global_deps, output_path, template_env, source_path):
-    """
-    Генерирует Dockerfile, entrypoint.py и копирует код сервиса.
-    """
+def create_stubs(service_build_dir, all_modules, current_service_name):
+    """Создает заглушки (пустые пакеты) для соседних сервисов"""
+    for module in all_modules:
+        mod_name = module['name']
+        if mod_name == current_service_name or mod_name in ['common', 'utils']:
+            continue
+            
+        stub_dir = os.path.join(service_build_dir, mod_name)
+        if not os.path.exists(stub_dir):
+            os.makedirs(stub_dir)
+            
+            with open(os.path.join(stub_dir, "__init__.py"), "w") as f:
+                f.write(f"# Stub for {mod_name}\n")
+            
+            # ИСПРАВЛЕНИЕ: Используем MagicMock, чтобы 'from module import X' всегда работало
+            with open(os.path.join(stub_dir, "models.py"), "w") as f:
+                f.write("""
+import sys
+from unittest.mock import MagicMock
+
+class MockModel(MagicMock):
+    # Позволяет создавать экземпляры класса: Order(id=1)
+    def __call__(self, *args, **kwargs):
+        return MockModel()
+    
+    # Позволяет обращаться к полям: Order.query.get(1)
+    def __getattr__(self, name):
+        return MockModel()
+
+# Заменяем текущий модуль на Mock-объект
+# Теперь любой импорт (from orders.models import Order) вернет MockModel
+sys.modules[__name__] = MockModel()
+""")
+                
+def render_service(module_info, all_modules, all_deps_map, output_path, template_env, source_path):
     service_name = module_info['name']
-    service_rel_path = module_info['path']
+    service_rel_path = module_info['path'] # Например: "users" или "."
     
-    # Полный путь к исходному коду сервиса
-    abs_source_path = os.path.join(source_path, service_rel_path)
-    
-    # Путь в docker_out для этого сервиса
+    # Путь куда будем собирать сервис: docker_out/users
     service_build_dir = os.path.join(output_path, service_name)
     os.makedirs(service_build_dir, exist_ok=True)
     
-    # --- 1. Копирование исходного кода модуля ---
+    # 1. КОПИРОВАНИЕ КОДА
+    # Копируем исходный код модуля в папку: docker_out/users/users
+    abs_source_path = os.path.join(source_path, service_rel_path)
+    service_code_dest = os.path.join(service_build_dir, service_name)
+    
+    if os.path.exists(service_code_dest): 
+        shutil.rmtree(service_code_dest)
+    
     if os.path.exists(abs_source_path):
-        print(f"   📂 [COPY] Копирование кода из {service_rel_path}...")
-        shutil.copytree(abs_source_path, service_build_dir, dirs_exist_ok=True)
+        shutil.copytree(abs_source_path, service_code_dest)
+    
+    # Гарантируем наличие __init__.py
+    if not os.path.exists(os.path.join(service_code_dest, "init.py")):
+        with open(os.path.join(service_code_dest, "init.py"), "w") as f: f.write("")
 
-    # --- 2. Обработка зависимостей ---
-    # Глобальные
-    if global_deps:
-        with open(os.path.join(service_build_dir, "global_requirements.txt"), "w") as f:
-            f.write("\n".join(global_deps))
+    # 2. СОЗДАНИЕ ЗАГЛУШЕК (чтобы from orders.models import ... не ломало код)
+    create_stubs(service_build_dir, all_modules, service_name)
+
+    # 3. ГЕНЕРАЦИЯ ВСПОМОГАТЕЛЬНЫХ ФАЙЛОВ
+    # API Bridge
+    api_bridge_content = template_env.get_template("api_bridge.jinja2").render(service_name=service_name)
+    with open(os.path.join(service_build_dir, "api_bridge.py"), "w") as f:
+        f.write(api_bridge_content)
+
+    # HTTP Client
+    client_content = template_env.get_template("http_client.jinja2").render()
+    with open(os.path.join(service_build_dir, "http_client.py"), "w") as f:
+        f.write(client_content)
+
+    # 4. СБОР ЗАВИСИМОСТЕЙ (ЕДИНЫЙ ФАЙЛ!)
+    final_deps = set()
+    
+    # а) Глобальные зависимости (из корня)
+    if '.' in all_deps_map:
+        final_deps.update(all_deps_map['.'])
         
-    # Локальные
-    local_req_source = os.path.join(abs_source_path, "requirements.txt")
-    has_local_reqs = os.path.exists(local_req_source) # <--- ВОТ ЗДЕСЬ МЫ ЕЁ ТЕПЕРЬ ОПРЕДЕЛЯЕМ ЯВНО
+    # б) Локальные зависимости модуля
+    if service_rel_path in all_deps_map:
+        final_deps.update(all_deps_map[service_rel_path])
+        
+    # в) Системные зависимости (для работы мостов)
+    final_deps.add("requests==2.31.0")
+    final_deps.add("Flask==3.0.0")
+    final_deps.add("Flask-SQLAlchemy==3.1.1")
     
-    if has_local_reqs:
-        shutil.copy(local_req_source, os.path.join(service_build_dir, "requirements.txt"))
+    with open(os.path.join(service_build_dir, "requirements.txt"), "w") as f:
+        f.write("\n".join(sorted(final_deps)))
 
-    # --- 3. Рендерим Entrypoint (Точку входа) ---
-    entry_template = template_env.get_template("entrypoint.jinja2")
-    entry_content = entry_template.render(service_name=service_name)
+    # 5. ENTRYPOINT (run.py)
+    # Собираем карту сервисов для конфига: {'users': 'http://users:5000', ...}
+    services_map = {m['name']: f"http://{m['name']}:5000" for m in all_modules if m['name'] not in ['utils', 'common']}
     
-    with open(os.path.join(service_build_dir, "entrypoint.py"), "w") as f:
+    # Используем шаблон entrypoint, но сохраняем как run.py
+    entry_content = template_env.get_template("entrypoint.jinja2").render(
+        service_name=service_name,
+        services_map=services_map
+    )
+    with open(os.path.join(service_build_dir, "run.py"), "w") as f:
         f.write(entry_content)
 
-    # --- 4. Рендерим Dockerfile ---
-    template = template_env.get_template("Dockerfile.jinja2")
-    dockerfile_content = template.render(
-        service_name=service_name,
-        local_requirements=has_local_reqs # Теперь переменная существует
+    # 6. DOCKERFILE
+    docker_content = template_env.get_template("Dockerfile.jinja2").render(
+        service_name=service_name
     )
-    
     with open(os.path.join(service_build_dir, "Dockerfile"), "w") as f:
-        f.write(dockerfile_content)
-    
-    print(f"   🔨 [GENERATOR] Артефакты для {service_name} готовы (+entrypoint)")
-
+        f.write(docker_content)
 def run_generation(source_path=None, output_path=None):
+    if not source_path or not os.path.exists(source_path):
+        print("Ошибка: Путь к монолиту не указан")
+        return
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
     templates_dir = os.path.join(project_root, "templates")
     
-    if not source_path:
-        source_path = os.path.join(project_root, "test_monolith_shop")
-    if not output_path:
-        output_path = os.path.join(project_root, "docker_out")
-
     # Очистка папки вывода
-    if os.path.exists(output_path):
-        shutil.rmtree(output_path)
+    if os.path.exists(output_path): shutil.rmtree(output_path)
     os.makedirs(output_path, exist_ok=True)
 
-    print(f"1️⃣  Запуск сканирования: {source_path}")
+    # 1. СКАНИРОВАНИЕ
     scan_result = scanner.scan_project_structure(source_path)
-    global_deps = scan_result.get('dependencies', {}).get('.', [])
+    
+    # Получаем карту всех зависимостей: {'users': ['pandas'], '.': ['flask']}
+    all_deps_map = scan_result.get('dependencies', {})
+    
+    # Получаем список модулей (исключая мусор)
+    modules = [m for m in scan_result.get('modules', []) 
+               if m['name'] not in ['pycache', 'instance', 'templates', 'venv', '.git']]
     
     env = Environment(loader=FileSystemLoader(templates_dir))
-    modules = scan_result.get('modules', [])
     
-    active_services = []
+    # 2. ГЕНЕРАЦИЯ СЕРВИСОВ
     for module in modules:
-        if module['name'] in ['__pycache__', 'instance', 'templates', 'venv', '.git']:
-            continue
-            
         try:
-            render_dockerfile(module, global_deps, output_path, env, source_path)
-            active_services.append(module)
+            render_service(module, modules, all_deps_map, output_path, env, source_path)
         except Exception as e:
-            print(f"⚠️ Ошибка при обработке модуля {module['name']}: {e}")
+            print(f"❌ Ошибка генерации сервиса {module['name']}: {e}")
+            import traceback
+            traceback.print_exc()
 
-    # Копирование общих файлов (db.py, app.py)
-    shared_files = ['db.py', 'app.py']
-    for file in shared_files:
-        full_path = os.path.join(source_path, file)
-        if os.path.exists(full_path):
-             for service in active_services:
-                 shutil.copy(full_path, os.path.join(output_path, service['name'], file))
+    # 3. КОПИРОВАНИЕ ОБЩИХ РЕСУРСОВ
+    for service in modules:
+        service_dir = os.path.join(output_path, service['name'])
+        
+        # Копируем ТОЛЬКО db.py (app.py больше не нужен, у нас есть run.py)
+        db_path = os.path.join(source_path, 'db.py')
+        if os.path.exists(db_path): 
+            shutil.copy(db_path, os.path.join(service_dir, 'db.py'))
+        
+        # Копируем utils
+        u_src = os.path.join(source_path, 'utils')
+        if os.path.exists(u_src): 
+            shutil.copytree(u_src, os.path.join(service_dir, 'utils'), dirs_exist_ok=True)
 
-    # Генерация docker-compose
-    if active_services:
-        print("4️⃣  Генерация docker-compose.yaml...")
-        compose_template = env.get_template("docker-compose.jinja2")
-        compose_content = compose_template.render(services=active_services)
-        with open(os.path.join(output_path, "docker-compose.yaml"), "w") as f:
-            f.write(compose_content)
-        print(f"\n✅ Миграция завершена! Проверь папку: {output_path}")
+    # 4. DOCKER COMPOSE
+    runnable_services = [s for s in modules if s['name'] not in ['utils', 'common']]
+    compose_content = env.get_template("docker-compose.jinja2").render(services=runnable_services)
+    with open(os.path.join(output_path, "docker-compose.yaml"), "w") as f:
+        f.write(compose_content)
+
+    print("✅ Генерация завершена успешно!")
 
 if __name__ == "__main__":
-    run_generation()
+    pass

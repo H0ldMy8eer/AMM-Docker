@@ -1,0 +1,33 @@
+import requests
+from flask import current_app
+
+class ServiceClient:
+    """
+    Клиент для общения с другими микросервисами.
+    Пример: data = ServiceClient.get('products', 'Product', 1)
+    """
+    
+    @staticmethod
+    def get(service_name, model_name, id):
+        base_url = current_app.config['SERVICES_URLS'].get(service_name)
+        if not base_url:
+            print(f"ERROR: Service {service_name} not found in config")
+            return None
+            
+        try:
+            url = f"{base_url}/internal/{model_name}/{id}"
+            resp = requests.get(url, timeout=2)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            print(f"Request failed: {e}")
+        return None
+
+    @staticmethod
+    def update(service_name, model_name, id, data):
+        base_url = current_app.config['SERVICES_URLS'].get(service_name)
+        try:
+            url = f"{base_url}/internal/{model_name}/update/{id}"
+            requests.post(url, json=data, timeout=2)
+        except Exception as e:
+            print(f"Update failed: {e}")

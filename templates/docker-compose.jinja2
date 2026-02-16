@@ -6,10 +6,11 @@ services:
     build:
       context: ./{{ service.name }}
       dockerfile: Dockerfile
-    volumes:
-      - ../test_monolith_shop/{{ service.path }}:/app/{{ service.name }}
     environment:
       - PYTHONPATH=/app
+      - FLASK_ENV=development
+    ports:
+      - "500{{ loop.index }}:5000" # Автоматический проброс портов 5001, 5002...
     networks:
       - app-network
 

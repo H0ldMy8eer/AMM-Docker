@@ -1,0 +1,12 @@
+import requests
+from flask import current_app
+
+class ServiceProxy:
+    def __init__(self, target_service):
+        self.target_service = target_service
+
+    def get_data(self, endpoint, params=None):
+        base_url = current_app.config['SERVICES_URLS'].get(self.target_service)
+        response = requests.get(f"{base_url}/{self.target_service}/{endpoint}", params=params)
+        return response.json() if response.status_code == 200 else None
+
