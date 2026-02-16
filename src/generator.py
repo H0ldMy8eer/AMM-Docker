@@ -1,7 +1,33 @@
+import re
 import os
 import shutil
 from jinja2 import Environment, FileSystemLoader
 import scanner
+
+def sanitize_models(service_dir):
+    """
+    Удаляет жесткие SQL-связи (ForeignKey и relationship) из моделей,
+    так как в микросервисах базы разделены.
+    """
+    print(f"🧹 Очистка моделей в {service_dir}...")
+    for root, _, files in os.walk(service_dir):
+        for file in files:
+            if file.endswith(".py"):
+                file_path = os.path.join(root, file)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # 1. Удаляем db.ForeignKey('...')
+                # Заменяем ", db.ForeignKey(...)" на пустоту
+                new_content = re.sub(r",\s*db\.ForeignKey\([^)]+\)", "", content)
+                
+                # 2. Удаляем db.relationship(...)
+                # Удаляем строки вида: orders = db.relationship(...)
+                new_content = re.sub(r"^\s*\w+\s*=\s*db\.relationship\(.+\).*$", "", new_content, flags=re.MULTILINE)
+                
+                if content != new_content:
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
 
 def create_stubs(service_build_dir, all_modules, current_service_name):
     """Создает заглушки (пустые пакеты) для соседних сервисов"""
@@ -17,24 +43,33 @@ def create_stubs(service_build_dir, all_modules, current_service_name):
             with open(os.path.join(stub_dir, "__init__.py"), "w") as f:
                 f.write(f"# Stub for {mod_name}\n")
             
-            # ИСПРАВЛЕНИЕ: Используем MagicMock, чтобы 'from module import X' всегда работало
+            # ИСПРАВЛЕНИЕ: Используем простую заглушку без MagicMock (чтобы избежать рекурсии)
             with open(os.path.join(stub_dir, "models.py"), "w") as f:
                 f.write("""
 import sys
-from unittest.mock import MagicMock
 
-class MockModel(MagicMock):
-    # Позволяет создавать экземпляры класса: Order(id=1)
+class Stub:
+    def __init__(self, *args, **kwargs):
+        pass
+
     def __call__(self, *args, **kwargs):
-        return MockModel()
-    
-    # Позволяет обращаться к полям: Order.query.get(1)
-    def __getattr__(self, name):
-        return MockModel()
+        # Если заглушку вызвали как функцию (например, Order(id=1)), возвращаем себя
+        return self
 
-# Заменяем текущий модуль на Mock-объект
-# Теперь любой импорт (from orders.models import Order) вернет MockModel
-sys.modules[__name__] = MockModel()
+    def __getattr__(self, name):
+        # Если у заглушки спросили атрибут (например, Order.query), возвращаем себя
+        return self
+
+    def __iter__(self):
+        # Если заглушку пытаются перебрать в цикле, возвращаем пустой список
+        return iter([])
+
+# ЗАМЕНА МОДУЛЯ:
+# Мы говорим Python, что этот файл (модуль) — это экземпляр класса Stub.
+# Теперь:
+# from orders.models import Order -> сработает (вернет Stub)
+# from orders.models import Product -> сработает (вернет Stub)
+sys.modules[__name__] = Stub()
 """)
                 
 def render_service(module_info, all_modules, all_deps_map, output_path, template_env, source_path):
@@ -56,6 +91,8 @@ def render_service(module_info, all_modules, all_deps_map, output_path, template
     if os.path.exists(abs_source_path):
         shutil.copytree(abs_source_path, service_code_dest)
     
+    sanitize_models(service_build_dir)
+
     # Гарантируем наличие __init__.py
     if not os.path.exists(os.path.join(service_code_dest, "init.py")):
         with open(os.path.join(service_code_dest, "init.py"), "w") as f: f.write("")
