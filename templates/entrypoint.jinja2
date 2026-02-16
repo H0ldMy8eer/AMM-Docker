@@ -1,0 +1,30 @@
+
+from flask import Flask
+from {{ service_name }}.routes import {{ service_name }}_bp
+import os
+
+# Импортируем общую базу данных (файл db.py, который мы скопировали)
+from db import db
+
+app = Flask(__name__)
+
+# --- Конфигурация ---
+# Используем SQLite файл внутри контейнера
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'database.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = 'dev-key-for-migration'
+
+# Инициализация БД
+db.init_app(app)
+
+# Регистрация ТОЛЬКО одного блюпринта
+app.register_blueprint({{ service_name }}_bp, url_prefix='/{{ service_name }}')
+
+@app.route('/health')
+def health():
+    return {"status": "ok", "service": "{{ service_name }}"}
+
+if __name__ == '__main__':
+    # Запуск на порту 5000 внутри контейнера
+    app.run(host='0.0.0.0', port=5000)
