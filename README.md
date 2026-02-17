@@ -31,7 +31,7 @@
 Перейдите в сгенерированную папку и запустите сборку:
     ```bash
     cd docker_out
-    ocker compose up --build
+    docker compose up --build
 ### 4. Проверка статуса
     После успешного запуска:
 
