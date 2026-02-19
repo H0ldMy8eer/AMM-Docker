@@ -3,34 +3,25 @@ import os
 import inspect
 from flask import Flask, Blueprint
 
-# Добавляем путь (фикс NameError)
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from db import db
 
 app = Flask(__name__)
 
-# --- АВТОМАТИЧЕСКИЙ ПОИСК BLUEPRINT ---
-# Мы не знаем, назвал юзер переменную 'user_bp', 'users_bp' или 'bp'.
-# Поэтому мы импортируем модуль и ищем в нем объект Blueprint.
-
 service_name = "{{ service_name }}"
 service_bp = None
 
-# Попытка 1: Ищем в routes.py
 try:
     import importlib
-    # Пробуем импортировать модуль (например, users.routes)
     module = importlib.import_module(f"{service_name}.routes")
 except ImportError:
-    # Попытка 2: Ищем в views.py (для старых версий)
     try:
         module = importlib.import_module(f"{service_name}.views")
     except ImportError as e:
         print(f"CRITICAL: Could not find 'routes.py' or 'views.py' in {service_name}")
         raise e
 
-# Перебираем все переменные в модуле и ищем Blueprint
 for name, obj in inspect.getmembers(module):
     if isinstance(obj, Blueprint):
         service_bp = obj
@@ -40,22 +31,27 @@ for name, obj in inspect.getmembers(module):
 if not service_bp:
     raise Exception(f"❌ No Blueprint found in {service_name}. Please define 'bp = Blueprint(...)'")
 
-# --- КОНФИГУРАЦИЯ ---
 basedir = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, f'{service_name}.db')
+
+db_url = os.environ.get('DATABASE_URL')
+if db_url:
+    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
+    print(f"🔌 Успешное подключение к PostgreSQL для {service_name}")
+else:
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, f'{service_name}.db')
+    print(f"⚠️ DATABASE_URL не найден, используем SQLite для {service_name}")
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SERVICES_URLS'] = {{ services_map }}
 
 db.init_app(app)
 
-# --- РЕГИСТРАЦИЯ МОСТА ---
 try:
     from api_bridge import api_bp
     app.register_blueprint(api_bp, url_prefix='/internal')
 except Exception as e:
     print(f"Warning: API Bridge skipped: {e}")
 
-# --- РЕГИСТРАЦИЯ ОСНОВНОГО СЕРВИСА ---
 app.register_blueprint(service_bp, url_prefix=f'/{service_name}')
 
 with app.app_context():
