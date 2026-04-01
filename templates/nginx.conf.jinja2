@@ -1,0 +1,29 @@
+events {
+    worker_connections 1024;
+}
+
+http {
+    server {
+        listen 80;
+
+        # Динамически генерируем маршруты для всех микросервисов
+        {% for service in services %}
+        location /{{ service.name }} {
+            proxy_pass http://{{ service.name }}:5000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            
+            # --- НОВЫЕ ПАРАМЕТРЫ ДЛЯ ПРАКТИЧЕСКОЙ РАБОТЫ ---
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_connect_timeout 60s;
+            proxy_read_timeout 60s;
+        }
+        {% endfor %}
+
+        # Если пользователь зашел просто на корень сайта, перекидываем его на страницу товаров
+        location / {
+            return 302 /products;
+        }
+    }
+}
