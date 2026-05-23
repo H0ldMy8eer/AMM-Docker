@@ -159,7 +159,10 @@ def run_generation(source_path=None, output_path=None):
             if os.path.exists(shared_src):
                 shutil.copytree(shared_src, os.path.join(service_dir, shared['name']), dirs_exist_ok=True)
 
-    # 4. ГЕНЕРАЦИЯ API GATEWAY (NGINX)
+    # 4. АНАЛИЗ ГРАФА ЗАВИСИМОСТЕЙ
+    scan_result['import_edges'] = scanner.analyze_import_graph(source_path, all_modules)
+
+    # 5. ГЕНЕРАЦИЯ API GATEWAY (NGINX)
     print(" Генерация API Gateway (Nginx)...")
     nginx_dir = os.path.join(output_path, "nginx")
     os.makedirs(nginx_dir, exist_ok=True)
@@ -167,7 +170,7 @@ def run_generation(source_path=None, output_path=None):
     with open(os.path.join(nginx_dir, "nginx.conf"), "w") as f:
         f.write(nginx_content)
 
-    # 5. ГЕНЕРАЦИЯ .env С СЛУЧАЙНЫМ ПАРОЛЕМ
+    # 6. ГЕНЕРАЦИЯ .env С СЛУЧАЙНЫМ ПАРОЛЕМ
     pg_password = generate_password()
     env_content = (
         "POSTGRES_USER=admin\n"
@@ -188,11 +191,21 @@ def run_generation(source_path=None, output_path=None):
 
     print(f"🔐 Сгенерирован случайный пароль БД → {env_path}")
 
-    # 6. DOCKER COMPOSE
+    # 7. КОНФИГИ ЛОГИРОВАНИЯ (Promtail + Grafana)
+    logging_dir = os.path.join(output_path, "logging")
+    os.makedirs(logging_dir, exist_ok=True)
+    for config_file in ("promtail-config.yaml", "grafana-datasource.yaml"):
+        src_config = os.path.join(templates_dir, config_file)
+        if os.path.exists(src_config):
+            shutil.copy(src_config, os.path.join(logging_dir, config_file))
+    print("📊 Конфиги Loki/Promtail/Grafana сгенерированы → logging/")
+
+    # 8. DOCKER COMPOSE
     compose_content = env.get_template("docker-compose.jinja2").render(services=runnable_services)
     with open(os.path.join(output_path, "docker-compose.yaml"), "w") as f:
         f.write(compose_content)
 
     print("\n✅ Генерация завершена успешно!")
+    return scan_result
 
 

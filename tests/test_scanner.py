@@ -107,3 +107,57 @@ class TestScanProjectStructure:
         result = scanner.scan_project_structure(str(tmp_path))
         names = [m['name'] for m in result['modules']]
         assert 'empty_module' not in names
+
+
+class TestAnalyzeImportGraph:
+    def test_detects_import_between_modules(self, tmp_path):
+        svc = tmp_path / "orders"
+        svc.mkdir()
+        (svc / "views.py").write_text("from common import db\n")
+
+        shared = tmp_path / "common"
+        shared.mkdir()
+        (shared / "db.py").write_text("# db")
+
+        modules = [
+            {'name': 'orders', 'path': 'orders', 'type': 'service'},
+            {'name': 'common', 'path': 'common', 'type': 'shared'},
+        ]
+        edges = scanner.analyze_import_graph(str(tmp_path), modules)
+        assert any(e['from'] == 'orders' and e['to'] == 'common' for e in edges)
+
+    def test_no_self_edges(self, tmp_path):
+        svc = tmp_path / "users"
+        svc.mkdir()
+        (svc / "views.py").write_text("from users import models\n")
+
+        modules = [{'name': 'users', 'path': 'users', 'type': 'service'}]
+        edges = scanner.analyze_import_graph(str(tmp_path), modules)
+        assert not any(e['from'] == e['to'] for e in edges)
+
+    def test_no_duplicate_edges(self, tmp_path):
+        svc = tmp_path / "orders"
+        svc.mkdir()
+        (svc / "views.py").write_text("from common import a\nfrom common import b\n")
+        (svc / "models.py").write_text("import common\n")
+
+        shared = tmp_path / "common"
+        shared.mkdir()
+        (shared / "utils.py").write_text("")
+
+        modules = [
+            {'name': 'orders', 'path': 'orders', 'type': 'service'},
+            {'name': 'common', 'path': 'common', 'type': 'shared'},
+        ]
+        edges = scanner.analyze_import_graph(str(tmp_path), modules)
+        pairs = [(e['from'], e['to']) for e in edges]
+        assert len(pairs) == len(set(pairs))
+
+    def test_returns_empty_when_no_imports(self, tmp_path):
+        svc = tmp_path / "users"
+        svc.mkdir()
+        (svc / "views.py").write_text("x = 1\n")
+
+        modules = [{'name': 'users', 'path': 'users', 'type': 'service'}]
+        edges = scanner.analyze_import_graph(str(tmp_path), modules)
+        assert edges == []
