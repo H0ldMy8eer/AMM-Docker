@@ -119,9 +119,11 @@ def run_generation(source_path=None, output_path=None):
     project_root = os.path.dirname(current_dir)
     templates_dir = os.path.join(project_root, "templates")
     
-    if os.path.exists(output_path): shutil.rmtree(output_path)
+    if os.path.exists(output_path): 
+        shutil.rmtree(output_path)
     os.makedirs(output_path, exist_ok=True)
 
+    # 1. СКАНИРОВАНИЕ
     scan_result = scanner.scan_project_structure(source_path)
     all_deps_map = scan_result.get('dependencies', {})
     
@@ -131,12 +133,14 @@ def run_generation(source_path=None, output_path=None):
     
     env = Environment(loader=FileSystemLoader(templates_dir))
     
+    # 2. ГЕНЕРАЦИЯ СЕРВИСОВ
     for module in runnable_services:
         try:
             render_service(module, all_modules, all_deps_map, output_path, env, source_path)
         except Exception as e:
             print(f"❌ Ошибка генерации сервиса {module['name']}: {e}")
 
+    # 3. КОПИРОВАНИЕ ОБЩИХ РЕСУРСОВ
     for service in runnable_services:
         service_dir = os.path.join(output_path, service['name'])
         
@@ -149,8 +153,19 @@ def run_generation(source_path=None, output_path=None):
             if os.path.exists(shared_src):
                 shutil.copytree(shared_src, os.path.join(service_dir, shared['name']), dirs_exist_ok=True)
 
+    # 4. ГЕНЕРАЦИЯ API GATEWAY (NGINX)
+    print("🌐 Генерация API Gateway (Nginx)...")
+    nginx_dir = os.path.join(output_path, "nginx")
+    os.makedirs(nginx_dir, exist_ok=True)
+    nginx_content = env.get_template("nginx.conf.jinja2").render(services=runnable_services)
+    with open(os.path.join(nginx_dir, "nginx.conf"), "w") as f:
+        f.write(nginx_content)
+
+    # 5. DOCKER COMPOSE
     compose_content = env.get_template("docker-compose.jinja2").render(services=runnable_services)
     with open(os.path.join(output_path, "docker-compose.yaml"), "w") as f:
         f.write(compose_content)
 
     print("\n✅ Генерация завершена успешно!")
+
+

@@ -66,7 +66,7 @@ class AMMApp(ctk.CTk):
         self.out_browse_btn.pack(side="right")
 
         # --- Кнопка старта (Уже и Выше) ---
-        self.run_btn = ctk.CTkButton(self, text="🚀 1. ЗАПУСТИТЬ МИГРАЦИЮ", 
+        self.run_btn = ctk.CTkButton(self, text="1. ЗАПУСТИТЬ МИГРАЦИЮ", 
                                      fg_color="#28a745", hover_color="#218838",
                                      font=("Roboto", 15, "bold"), height=45)
         self.run_btn.configure(command=self.start_migration)
