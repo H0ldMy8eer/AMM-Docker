@@ -21,9 +21,10 @@ http {
         }
         {% endfor %}
 
-        # Если пользователь зашел просто на корень сайта, перекидываем его на страницу товаров
+        {% if services %}
         location / {
-            return 302 /products;
+            return 302 /{{ services[0].name }};
         }
+        {% endif %}
     }
 }

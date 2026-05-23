@@ -2,11 +2,17 @@
 import re
 import os
 import shutil
+import secrets
+import string
 from jinja2 import Environment, FileSystemLoader
 import scanner
 
+def generate_password(length=24):
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
 def sanitize_models(service_dir):
-    print(f"🧹 Очистка моделей в {service_dir}...")
+    print(f" Очистка моделей в {service_dir}...")
     for root, _, files in os.walk(service_dir):
         for file in files:
             if file.endswith(".py"):
@@ -154,14 +160,35 @@ def run_generation(source_path=None, output_path=None):
                 shutil.copytree(shared_src, os.path.join(service_dir, shared['name']), dirs_exist_ok=True)
 
     # 4. ГЕНЕРАЦИЯ API GATEWAY (NGINX)
-    print("🌐 Генерация API Gateway (Nginx)...")
+    print(" Генерация API Gateway (Nginx)...")
     nginx_dir = os.path.join(output_path, "nginx")
     os.makedirs(nginx_dir, exist_ok=True)
     nginx_content = env.get_template("nginx.conf.jinja2").render(services=runnable_services)
     with open(os.path.join(nginx_dir, "nginx.conf"), "w") as f:
         f.write(nginx_content)
 
-    # 5. DOCKER COMPOSE
+    # 5. ГЕНЕРАЦИЯ .env С СЛУЧАЙНЫМ ПАРОЛЕМ
+    pg_password = generate_password()
+    env_content = (
+        "POSTGRES_USER=admin\n"
+        f"POSTGRES_PASSWORD={pg_password}\n"
+        "POSTGRES_DB=microservices_db\n"
+    )
+    env_path = os.path.join(output_path, ".env")
+    with open(env_path, "w") as f:
+        f.write(env_content)
+
+    example_content = (
+        "POSTGRES_USER=admin\n"
+        "POSTGRES_PASSWORD=<your-secure-password>\n"
+        "POSTGRES_DB=microservices_db\n"
+    )
+    with open(os.path.join(output_path, ".env.example"), "w") as f:
+        f.write(example_content)
+
+    print(f"🔐 Сгенерирован случайный пароль БД → {env_path}")
+
+    # 6. DOCKER COMPOSE
     compose_content = env.get_template("docker-compose.jinja2").render(services=runnable_services)
     with open(os.path.join(output_path, "docker-compose.yaml"), "w") as f:
         f.write(compose_content)

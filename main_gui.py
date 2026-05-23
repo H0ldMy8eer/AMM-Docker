@@ -76,7 +76,7 @@ class AMMApp(ctk.CTk):
         self.docker_frame = ctk.CTkFrame(self)
         self.docker_frame.pack(padx=40, pady=5, fill="x")
         
-        self.docker_label = ctk.CTkLabel(self.docker_frame, text="Управление Docker (Mac OS)", font=("Roboto", 13, "bold"))
+        self.docker_label = ctk.CTkLabel(self.docker_frame, text="Управление Docker", font=("Roboto", 13, "bold"))
         self.docker_label.pack(pady=(5, 5))
 
         self.docker_btns_frame = ctk.CTkFrame(self.docker_frame, fg_color="transparent")

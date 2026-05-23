@@ -30,7 +30,7 @@ def scan_project_structure(root_path):
         "files": []          
     }
 
-    print(f"🔍 [SCANNER] Начинаю глубокий анализ монолита: {root_path}")
+    print(f"🔍 [SCANNER] Начинаю анализ монолита: {root_path}")
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         dirnames[:] = [d for d in dirnames if not d.startswith('.') and d not in ['__pycache__', 'venv', 'env', 'node_modules', 'instance']]
@@ -43,7 +43,7 @@ def scan_project_structure(root_path):
             deps = parse_requirements(full_req_path)
             project_map["dependencies"][rel_path] = deps
 
-        if depth == 0 and rel_path != ".":
+        if depth == 1 and rel_path != ".":
             py_files = [f for f in filenames if f.endswith(".py")]
             
             if py_files:
