@@ -1,5 +1,8 @@
 from flask import Blueprint, jsonify, request, current_app
-from {{ service_name }}.models import *
+try:
+    from {{ service_name }}.models import *
+except ImportError:
+    pass
 from db import db
 
 api_bp = Blueprint('internal_api', __name__)

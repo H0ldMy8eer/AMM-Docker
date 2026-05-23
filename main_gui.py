@@ -2,6 +2,7 @@ import customtkinter as ctk
 import tkinter
 from tkinter import filedialog, messagebox
 import threading
+import shutil
 import sys
 import os
 import subprocess
@@ -46,7 +47,7 @@ class AMMApp(ctk.CTk):
 
         # --- Кнопка сканирования (всегда видна) ---
         self.scan_btn = ctk.CTkButton(
-            self, text="🔍 СКАНИРОВАТЬ",
+            self, text="СКАНИРОВАТЬ",
             fg_color="#0d6efd", hover_color="#0b5ed7",
             font=("Roboto", 15, "bold"), height=45,
             command=self.start_scan
@@ -82,10 +83,18 @@ class AMMApp(ctk.CTk):
 
         # Кнопка карты зависимостей
         self.map_btn = ctk.CTkButton(
-            self, text="🗺 Карта зависимостей",
+            self, text="Карта зависимостей",
             fg_color="#6d28d9", hover_color="#5b21b6",
             font=("Roboto", 13, "bold"), height=38,
             command=self.show_dependency_map
+        )
+
+        # Кнопка удаления docker_out + БД
+        self.delete_btn = ctk.CTkButton(
+            self, text="Удалить docker_out + БД",
+            fg_color="#7f1d1d", hover_color="#991b1b",
+            font=("Roboto", 13, "bold"), height=38,
+            command=self.delete_docker_out
         )
 
         # --- Терминал ---
@@ -142,6 +151,7 @@ class AMMApp(ctk.CTk):
         self.regen_btn.pack_forget()
         self.docker_frame.pack_forget()
         self.map_btn.pack_forget()
+        self.delete_btn.pack_forget()
 
     def _show_after_generation(self):
         """Показывает полный набор кнопок после успешной генерации."""
@@ -149,6 +159,7 @@ class AMMApp(ctk.CTk):
         self.regen_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
         self.docker_frame.pack(padx=40, pady=5, fill="x", before=self.log_view)
         self.map_btn.pack(padx=40, pady=(0, 5), fill="x", before=self.log_view)
+        self.delete_btn.pack(padx=40, pady=(0, 8), fill="x", before=self.log_view)
 
     def _show_after_scan_with_output(self):
         """docker_out найден — генерация не нужна, сразу показываем Docker-кнопки."""
@@ -156,11 +167,13 @@ class AMMApp(ctk.CTk):
         self.regen_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
         self.docker_frame.pack(padx=40, pady=5, fill="x", before=self.log_view)
         self.map_btn.pack(padx=40, pady=(0, 5), fill="x", before=self.log_view)
+        self.delete_btn.pack(padx=40, pady=(0, 8), fill="x", before=self.log_view)
 
     def _show_after_scan_no_output(self):
         """docker_out не найден — предлагаем сгенерировать."""
         self.regen_btn.pack_forget()
         self.docker_frame.pack_forget()
+        self.delete_btn.pack_forget()
         self.generate_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
         self.map_btn.pack(padx=40, pady=(0, 5), fill="x", before=self.log_view)
 
@@ -337,7 +350,50 @@ class AMMApp(ctk.CTk):
             return
         print("\n🛑 Остановка контейнеров (Down)...")
         threading.Thread(target=self.run_subprocess,
-                         args=(["docker", "compose", "down", "-v"],), daemon=True).start()
+                         args=(["docker", "compose", "down"],), daemon=True).start()
+
+    def delete_docker_out(self):
+        if not self.final_output_path or not os.path.exists(self.final_output_path):
+            messagebox.showerror("Ошибка", "Папка docker_out не найдена.")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Подтверждение удаления",
+            "Вы действительно хотите удалить docker_out вместе с БД?\n\n"
+            "Это удалит:\n"
+            "• Папку docker_out со всеми сгенерированными файлами\n"
+            "• Docker volume с данными PostgreSQL (postgres_data)\n\n"
+            "Оригинальный код монолита затронут НЕ будет.",
+            icon="warning"
+        )
+        if not confirmed:
+            return
+
+        print("\n🗑 Удаление docker_out и БД...")
+        threading.Thread(target=self._run_delete, daemon=True).start()
+
+    def _run_delete(self):
+        # 1. Останавливаем контейнеры и удаляем volume с данными БД
+        if os.path.exists(self.final_output_path):
+            self.run_subprocess(["docker", "compose", "down", "-v"])
+
+        # 2. Удаляем папку docker_out
+        try:
+            if os.path.exists(self.final_output_path):
+                shutil.rmtree(self.final_output_path)
+            print("✅ Папка docker_out удалена.\n")
+        except Exception as e:
+            print(f"❌ Не удалось удалить docker_out: {e}\n")
+            return
+
+        # 3. Обновляем UI
+        self.after(0, self._after_delete)
+
+    def _after_delete(self):
+        self._hide_action_buttons()
+        self.generate_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
+        self.map_btn.pack(padx=40, pady=(0, 5), fill="x", before=self.log_view)
+        print("✅ Готово. Нажмите «Генерировать» для повторного создания.\n")
 
     def _open_browser(self):
         url = "http://localhost:8888"
