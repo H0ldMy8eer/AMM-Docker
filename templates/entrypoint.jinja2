@@ -1,65 +1,174 @@
 import sys
 import os
 import inspect
-from flask import Flask, Blueprint
+import importlib
+from flask import Flask, Blueprint, Response
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from db import db
-
-app = Flask(__name__)
-
 service_name = "{{ service_name }}"
-service_bp = None
+url_prefix   = "{{ url_prefix }}"
 
-try:
-    import importlib
-    module = importlib.import_module(f"{service_name}.routes")
-except ImportError:
+# ──────────────────────────────────────────────────────────────
+# 1. Пробуем использовать оригинальный app factory монолита.
+#    Это гарантирует инициализацию ВСЕХ расширений (LoginManager,
+#    Mail, CSRFProtect и т.д.) точно так же как в монолите.
+# ──────────────────────────────────────────────────────────────
+app = None
+for _mod_name in ['app', 'application', 'wsgi', 'factory', 'main']:
     try:
-        module = importlib.import_module(f"{service_name}.views")
-    except ImportError as e:
-        print(f"CRITICAL: Could not find 'routes.py' or 'views.py' in {service_name}")
-        raise e
+        _mod = importlib.import_module(_mod_name)
+        if hasattr(_mod, 'create_app') and callable(_mod.create_app):
+            app = _mod.create_app()
+            print(f"✅ Используем оригинальный create_app() из '{_mod_name}'")
+            break
+        if hasattr(_mod, 'app') and isinstance(getattr(_mod, 'app'), Flask):
+            app = _mod.app
+            print(f"✅ Используем app instance из '{_mod_name}.app'")
+            break
+    except Exception as _e:
+        continue
 
-for name, obj in inspect.getmembers(module):
-    if isinstance(obj, Blueprint):
-        service_bp = obj
-        print(f"✅ Found Blueprint: {name}")
-        break
+# ──────────────────────────────────────────────────────────────
+# 2. Fallback: создаём Flask-приложение с нуля + авто-инит расширений
+# ──────────────────────────────────────────────────────────────
+if app is None:
+    print(f"⚠️  Оригинальный app factory не найден — создаём приложение вручную")
+    from db import db
 
-if not service_bp:
-    raise Exception(f"❌ No Blueprint found in {service_name}. Please define 'bp = Blueprint(...)'")
+    app = Flask(__name__)
+    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', os.urandom(24).hex())
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config['SERVICES_URLS'] = {{ services_map }}
 
-basedir = os.path.abspath(os.path.dirname(__file__))
+    db_url = os.environ.get('DATABASE_URL')
+    if db_url:
+        app.config['SQLALCHEMY_DATABASE_URI'] = db_url
+    else:
+        _basedir = os.path.abspath(os.path.dirname(__file__))
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(_basedir, f'{service_name}.db')
 
-db_url = os.environ.get('DATABASE_URL')
-if db_url:
-    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
-    print(f"🔌 Успешное подключение к PostgreSQL для {service_name}")
+    db.init_app(app)
+
+    # Авто-инициализация расширений из extensions.py / ext.py
+    for _ext_mod_name in ('extensions', 'ext', 'exts'):
+        try:
+            _ext_mod = importlib.import_module(_ext_mod_name)
+            for _attr in dir(_ext_mod):
+                if _attr.startswith('_'):
+                    continue
+                _obj = getattr(_ext_mod, _attr)
+                if hasattr(_obj, 'init_app') and callable(getattr(_obj, 'init_app', None)):
+                    try:
+                        _obj.init_app(app)
+                        print(f"✅ Auto init_app: {_attr}")
+                    except Exception as _e:
+                        print(f"⚠️  init_app failed for {_attr}: {_e}")
+            break
+        except ImportError:
+            continue
+
+    # Регистрируем Blueprint
+    try:
+        from api_bridge import api_bp
+        app.register_blueprint(api_bp, url_prefix='/internal')
+    except Exception as _e:
+        print(f"Warning: API Bridge skipped: {_e}")
+
+{% if import_path %}
+    # Режим автодекомпозиции: импортируем конкретный blueprint
+    try:
+        _mod = importlib.import_module("{{ import_path }}")
+        _bp = getattr(_mod, "{{ blueprint_var }}", None)
+        if _bp is None:
+            for _, _obj in inspect.getmembers(_mod):
+                if isinstance(_obj, Blueprint):
+                    _bp = _obj
+                    break
+        if _bp is None:
+            raise Exception("Blueprint '{{ blueprint_var }}' не найден в {{ import_path }}")
+        app.register_blueprint(_bp, url_prefix=url_prefix)
+        print(f"✅ Registered: {_bp.name} → {url_prefix}")
+    except Exception as _e:
+        print(f"CRITICAL: {_e}")
+        raise
+{% else %}
+    # Режим директории: ищем все Blueprint в модуле сервиса
+    _module = None
+    for _mod_name in ('routes', 'views', 'api', 'handlers', 'endpoints', 'resources'):
+        try:
+            _module = importlib.import_module(f"{service_name}.{_mod_name}")
+            break
+        except ImportError:
+            continue
+    if _module is None:
+        try:
+            _module = importlib.import_module(service_name)
+        except ImportError as _e:
+            print(f"CRITICAL: модуль '{service_name}' не найден")
+            raise
+
+    _registered = set()
+    for _name, _obj in inspect.getmembers(_module):
+        if not isinstance(_obj, Blueprint) or _obj.name in _registered:
+            continue
+        _registered.add(_obj.name)
+        if _obj.url_prefix is not None:
+            _combined = f"{url_prefix.rstrip('/')}{_obj.url_prefix}"
+            app.register_blueprint(_obj, url_prefix=_combined)
+        else:
+            app.register_blueprint(_obj, url_prefix=url_prefix)
+
+    if not _registered:
+        raise Exception(f"❌ Blueprint не найден в {service_name}")
+{% endif %}
+
+    with app.app_context():
+        try:
+            db.create_all()
+        except Exception as _e:
+            print(f"Warning: db.create_all() failed: {_e}")
+
+# ──────────────────────────────────────────────────────────────
+# 3. Если используем оригинальный app — только переопределяем БД
+# ──────────────────────────────────────────────────────────────
 else:
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, f'{service_name}.db')
-    print(f"⚠️ DATABASE_URL не найден, используем SQLite для {service_name}")
+    _db_url = os.environ.get('DATABASE_URL')
+    if _db_url:
+        app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
+        try:
+            from db import db
+            db.init_app(app)
+            with app.app_context():
+                db.create_all()
+        except Exception as _e:
+            print(f"Warning: db override failed: {_e}")
 
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SERVICES_URLS'] = {{ services_map }}
-
-db.init_app(app)
-
-try:
-    from api_bridge import api_bp
-    app.register_blueprint(api_bp, url_prefix='/internal')
-except Exception as e:
-    print(f"Warning: API Bridge skipped: {e}")
-
-app.register_blueprint(service_bp, url_prefix=f'/{service_name}')
-
-with app.app_context():
-    db.create_all()
-
+# ──────────────────────────────────────────────────────────────
+# 4. Общие маршруты
+# ──────────────────────────────────────────────────────────────
 @app.route('/health')
-def health():
+def _health():
     return {"status": "ok", "service": service_name}
+
+# Страница-индекс: показывает все доступные маршруты сервиса
+try:
+    @app.route(url_prefix.rstrip('/') + '/')
+    @app.route(url_prefix.rstrip('/'))
+    def _index():
+        routes = sorted(
+            str(r) for r in app.url_map.iter_rules()
+            if not str(r).startswith('/internal')
+            and not str(r).startswith('/health')
+            and '<' not in str(r)
+        )
+        links = ''.join(f'<li><a href="{r}">{r}</a></li>' for r in routes)
+        return Response(
+            f'<h2>Service: {service_name}</h2><ul>{links}</ul>',
+            mimetype='text/html'
+        )
+except AssertionError:
+    pass  # маршрут уже зарегистрирован оригинальным app
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

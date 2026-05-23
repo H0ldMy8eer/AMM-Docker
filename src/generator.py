@@ -63,22 +63,34 @@ sys.modules[__name__] = Stub()
 def render_service(module_info, all_modules, all_deps_map, output_path, template_env, source_path):
     service_name = module_info['name']
     service_rel_path = module_info['path']
-    
+    is_per_file = 'module_file' in module_info
+
     service_build_dir = os.path.join(output_path, service_name)
     os.makedirs(service_build_dir, exist_ok=True)
-    
+
     abs_source_path = os.path.join(source_path, service_rel_path)
-    service_code_dest = os.path.join(service_build_dir, service_name)
-    
-    if os.path.exists(service_code_dest): 
-        shutil.rmtree(service_code_dest)
-    if os.path.exists(abs_source_path):
-        shutil.copytree(abs_source_path, service_code_dest)
-    
+
+    if is_per_file:
+        # Копируем ВСЮ папку-контейнер (нужна для относительных импортов внутри пакета)
+        container_name = os.path.basename(service_rel_path)
+        service_code_dest = os.path.join(service_build_dir, container_name)
+        if os.path.exists(service_code_dest):
+            shutil.rmtree(service_code_dest)
+        if os.path.exists(abs_source_path):
+            shutil.copytree(abs_source_path, service_code_dest)
+    else:
+        # Стандартный случай: копируем папку сервиса
+        service_code_dest = os.path.join(service_build_dir, service_name)
+        if os.path.exists(service_code_dest):
+            shutil.rmtree(service_code_dest)
+        if os.path.exists(abs_source_path):
+            shutil.copytree(abs_source_path, service_code_dest)
+
     sanitize_models(service_build_dir)
 
     if not os.path.exists(os.path.join(service_code_dest, "__init__.py")):
-        with open(os.path.join(service_code_dest, "__init__.py"), "w") as f: f.write("")
+        with open(os.path.join(service_code_dest, "__init__.py"), "w") as f:
+            f.write("")
 
     create_stubs(service_build_dir, all_modules, service_name)
 
@@ -91,23 +103,28 @@ def render_service(module_info, all_modules, all_deps_map, output_path, template
         f.write(client_content)
 
     final_deps = set()
-    if '.' in all_deps_map: final_deps.update(all_deps_map['.'])
-    if service_rel_path in all_deps_map: final_deps.update(all_deps_map[service_rel_path])
-    
+    if '.' in all_deps_map:
+        final_deps.update(all_deps_map['.'])
+    if service_rel_path in all_deps_map:
+        final_deps.update(all_deps_map[service_rel_path])
+
     final_deps.add("requests==2.31.0")
     final_deps.add("Flask==3.0.0")
     final_deps.add("Flask-SQLAlchemy==3.1.1")
     final_deps.add("psycopg2-binary==2.9.9")
-    
+
     with open(os.path.join(service_build_dir, "requirements.txt"), "w") as f:
         f.write("\n".join(sorted(final_deps)))
 
     runnable_services = [m for m in all_modules if m.get('type') == 'service']
     services_map = {m['name']: f"http://{m['name']}:5000" for m in runnable_services}
-    
+
     entry_content = template_env.get_template("entrypoint.jinja2").render(
         service_name=service_name,
-        services_map=services_map
+        services_map=services_map,
+        import_path=module_info.get('import_path'),
+        blueprint_var=module_info.get('blueprint_var'),
+        url_prefix=module_info.get('url_prefix', f'/{service_name}'),
     )
     with open(os.path.join(service_build_dir, "run.py"), "w") as f:
         f.write(entry_content)
@@ -149,15 +166,42 @@ def run_generation(source_path=None, output_path=None):
     # 3. КОПИРОВАНИЕ ОБЩИХ РЕСУРСОВ
     for service in runnable_services:
         service_dir = os.path.join(output_path, service['name'])
-        
-        db_path = os.path.join(source_path, 'db.py')
-        if os.path.exists(db_path): 
-            shutil.copy(db_path, os.path.join(service_dir, 'db.py'))
-        
+
+        db_dest = os.path.join(service_dir, 'db.py')
+        db_src = os.path.join(source_path, 'db.py')
+        if os.path.exists(db_src):
+            shutil.copy(db_src, db_dest)
+        elif not os.path.exists(db_dest):
+            # Генерируем минимальный db.py если в монолите его нет
+            with open(db_dest, 'w') as f:
+                f.write("from flask_sqlalchemy import SQLAlchemy\ndb = SQLAlchemy()\n")
+
         for shared in shared_libs:
-            shared_src = os.path.join(source_path, shared['name'])
+            shared_src = os.path.join(source_path, shared['path'])
             if os.path.exists(shared_src):
                 shutil.copytree(shared_src, os.path.join(service_dir, shared['name']), dirs_exist_ok=True)
+
+        # Копируем глобальные templates/ и static/ из корня монолита если они есть
+        for root_resource in ('templates', 'static'):
+            resource_src = os.path.join(source_path, root_resource)
+            if os.path.exists(resource_src):
+                resource_dst = os.path.join(service_dir, root_resource)
+                shutil.copytree(resource_src, resource_dst, dirs_exist_ok=True)
+
+        # Копируем корневые .py файлы (models.py, config.py, extensions.py и т.д.)
+        # чтобы сервисные импорты типа "from models import db" работали
+        _skip_root_files = {'run.py', 'app.py'}
+        for fname in os.listdir(source_path):
+            if not fname.endswith('.py'):
+                continue
+            if fname in _skip_root_files:
+                continue
+            src_file = os.path.join(source_path, fname)
+            if not os.path.isfile(src_file):
+                continue
+            dst_file = os.path.join(service_dir, fname)
+            if not os.path.exists(dst_file):  # не перезаписываем сгенерированный db.py
+                shutil.copy(src_file, dst_file)
 
     # 4. АНАЛИЗ ГРАФА ЗАВИСИМОСТЕЙ
     scan_result['import_edges'] = scanner.analyze_import_graph(source_path, all_modules)
@@ -172,10 +216,12 @@ def run_generation(source_path=None, output_path=None):
 
     # 6. ГЕНЕРАЦИЯ .env С СЛУЧАЙНЫМ ПАРОЛЕМ
     pg_password = generate_password()
+    secret_key = generate_password(32)
     env_content = (
         "POSTGRES_USER=admin\n"
         f"POSTGRES_PASSWORD={pg_password}\n"
         "POSTGRES_DB=microservices_db\n"
+        f"SECRET_KEY={secret_key}\n"
     )
     env_path = os.path.join(output_path, ".env")
     with open(env_path, "w") as f:
@@ -185,6 +231,7 @@ def run_generation(source_path=None, output_path=None):
         "POSTGRES_USER=admin\n"
         "POSTGRES_PASSWORD=<your-secure-password>\n"
         "POSTGRES_DB=microservices_db\n"
+        "SECRET_KEY=<your-secret-key>\n"
     )
     with open(os.path.join(output_path, ".env.example"), "w") as f:
         f.write(example_content)

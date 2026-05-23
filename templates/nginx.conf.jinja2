@@ -7,16 +7,16 @@ http {
         listen 80;
 
         {% for service in services %}
-        location = /{{ service.name }} {
-            return 301 $scheme://$http_host/{{ service.name }}/;
+        {% set loc = service.url_prefix if service.url_prefix else '/' + service.name %}
+        location = {{ loc }} {
+            return 301 $scheme://$http_host{{ loc }}/;
         }
-        location /{{ service.name }}/ {
+        location {{ loc }}/ {
             proxy_pass http://{{ service.name }}:5000;
             proxy_set_header Host $http_host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            # Переписываем Location от Flask: http://service:5000/... → http://localhost:8888/...
             proxy_redirect http://{{ service.name }}:5000/ $scheme://$http_host/;
             proxy_connect_timeout 60s;
             proxy_read_timeout 60s;
@@ -24,8 +24,9 @@ http {
         {% endfor %}
 
         {% if services %}
+        {% set first_loc = services[0].url_prefix if services[0].url_prefix else '/' + services[0].name %}
         location / {
-            return 302 $scheme://$http_host/{{ services[0].name }}/;
+            return 302 $scheme://$http_host{{ first_loc }}/;
         }
         {% endif %}
     }
