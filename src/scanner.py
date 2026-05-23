@@ -30,7 +30,7 @@ def scan_project_structure(root_path):
         "files": []          
     }
 
-    print(f"🔍 [SCANNER] Начинаю глубокий анализ монолита: {root_path}")
+    print(f"🔍 [SCANNER] Начинаю анализ монолита: {root_path}")
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         dirnames[:] = [d for d in dirnames if not d.startswith('.') and d not in ['__pycache__', 'venv', 'env', 'node_modules', 'instance']]
