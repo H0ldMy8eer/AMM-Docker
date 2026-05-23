@@ -1,116 +1,112 @@
 import customtkinter as ctk
+import tkinter
 from tkinter import filedialog, messagebox
 import threading
 import sys
 import os
 import subprocess
+import webbrowser
+import urllib.request
+import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(current_dir, 'src'))
 
 import generator
+import scanner
+
 
 class AMMApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        # --- Настройки окна ---
         self.title("AMM-Docker")
-        window_width = 500  # Чуть расширил для красивого терминала
+        window_width = 500
         window_height = 720
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
-        
         x = (screen_width // 2) - (window_width // 2)
-        y = (screen_height // 2) - (window_height // 2)
-        y = max(30, y)
-        
+        y = max(30, (screen_height // 2) - (window_height // 2))
         self.geometry(f"{window_width}x{window_height}+{x}+{y}")
         self.minsize(450, 650)
-        
+
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
-        # --- Заголовок (Больше и ниже) ---
-        self.title_label = ctk.CTkLabel(self, text="AMM-DOCKER", font=("Roboto", 32, "bold"))
-        self.title_label.pack(pady=(40, 0)) # Увеличили верхний отступ
-        self.sub_label = ctk.CTkLabel(self, text="Migration Assistant", font=("Roboto", 14), text_color="gray")
-        self.sub_label.pack(pady=(0, 15))
+        # --- Заголовок ---
+        ctk.CTkLabel(self, text="AMM-DOCKER", font=("Roboto", 32, "bold")).pack(pady=(40, 0))
+        ctk.CTkLabel(self, text="Migration Assistant", font=("Roboto", 14), text_color="gray").pack(pady=(0, 15))
 
-        # --- Блок 1: Исходный код ---
-        self.path_label = ctk.CTkLabel(self, text="1. Путь к монолиту:", font=("Roboto", 13, "bold"))
-        self.path_label.pack(anchor="w", padx=40, pady=(5, 0))
-        
+        # --- Путь к монолиту ---
+        ctk.CTkLabel(self, text="Путь к монолиту:", font=("Roboto", 13, "bold")).pack(anchor="w", padx=40, pady=(5, 0))
         self.path_entry = ctk.CTkEntry(self, placeholder_text="Выберите папку с кодом...", height=40)
         self.path_entry.pack(padx=40, pady=5, fill="x")
+        ctk.CTkButton(self, text="📂 ВЫБРАТЬ ПАПКУ", fg_color="#3b3b3b", hover_color="#4b4b4b",
+                      height=40, command=self.browse_source).pack(padx=40, fill="x")
 
-        # Кнопка: Уже (за счет padx=40) и Выше (height=40)
-        self.browse_btn = ctk.CTkButton(self, text="📂 ВЫБРАТЬ ИСХОДНИК", fg_color="#3b3b3b", hover_color="#4b4b4b", height=40, command=self.browse_source)
-        self.browse_btn.pack(padx=40, fill="x")
+        # --- Кнопка сканирования (всегда видна) ---
+        self.scan_btn = ctk.CTkButton(
+            self, text="🔍 СКАНИРОВАТЬ",
+            fg_color="#0d6efd", hover_color="#0b5ed7",
+            font=("Roboto", 15, "bold"), height=45,
+            command=self.start_scan
+        )
+        self.scan_btn.pack(padx=40, pady=10, fill="x")
 
-        # --- Блок 2: Настройка вывода ---
-        self.sep = ctk.CTkLabel(self, text="----------------------------------------", text_color="gray")
-        self.sep.pack(pady=5)
+        # --- Динамические кнопки (появляются после сканирования) ---
+        # Кнопка генерации (если docker_out не найден)
+        self.generate_btn = ctk.CTkButton(
+            self, text="⚙️ ГЕНЕРИРОВАТЬ",
+            fg_color="#28a745", hover_color="#218838",
+            font=("Roboto", 14, "bold"), height=42,
+            command=self.start_generation
+        )
 
-        self.use_default_output = ctk.BooleanVar(value=True)
-        self.output_checkbox = ctk.CTkCheckBox(self, text="Сохранить результат внутри проекта", 
-                                               variable=self.use_default_output, 
-                                               command=self.toggle_output_input,
-                                               font=("Roboto", 12))
-        self.output_checkbox.pack(pady=5, padx=40, anchor="w")
+        # Кнопка перегенерации (если docker_out уже есть или после генерации)
+        self.regen_btn = ctk.CTkButton(
+            self, text="🔄 ПЕРЕГЕНЕРИРОВАТЬ",
+            fg_color="#5c636a", hover_color="#494f54",
+            font=("Roboto", 13, "bold"), height=38,
+            command=self.start_generation
+        )
 
-        self.custom_output_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.out_path_entry = ctk.CTkEntry(self.custom_output_frame, placeholder_text="Куда сохранить результат?", height=40)
-        self.out_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.out_browse_btn = ctk.CTkButton(self.custom_output_frame, text="...", width=45, height=40, fg_color="#3b3b3b", command=self.browse_output)
-        self.out_browse_btn.pack(side="right")
-
-        # --- Кнопка старта (Уже и Выше) ---
-        self.run_btn = ctk.CTkButton(self, text="1. ЗАПУСТИТЬ МИГРАЦИЮ", 
-                                     fg_color="#28a745", hover_color="#218838",
-                                     font=("Roboto", 15, "bold"), height=45)
-        self.run_btn.configure(command=self.start_migration)
-        self.run_btn.pack(padx=40, pady=10, fill="x")
-
-        # --- БЛОК 3: Управление Docker ---
+        # Блок управления Docker
         self.docker_frame = ctk.CTkFrame(self)
-        self.docker_frame.pack(padx=40, pady=5, fill="x")
-        
-        self.docker_label = ctk.CTkLabel(self.docker_frame, text="Управление Docker", font=("Roboto", 13, "bold"))
-        self.docker_label.pack(pady=(5, 5))
+        ctk.CTkLabel(self.docker_frame, text="Управление Docker", font=("Roboto", 13, "bold")).pack(pady=(5, 5))
+        docker_btns = ctk.CTkFrame(self.docker_frame, fg_color="transparent")
+        docker_btns.pack(pady=(0, 10), fill="x", padx=10)
+        ctk.CTkButton(docker_btns, text="▶️ Поднять", fg_color="#007bff", hover_color="#0056b3",
+                      height=40, command=self.docker_up).pack(side="left", expand=True, padx=5)
+        ctk.CTkButton(docker_btns, text="⏹ Остановить", fg_color="#dc3545", hover_color="#c82333",
+                      height=40, command=self.docker_down).pack(side="right", expand=True, padx=5)
 
-        self.docker_btns_frame = ctk.CTkFrame(self.docker_frame, fg_color="transparent")
-        self.docker_btns_frame.pack(pady=(0, 10), fill="x", padx=10)
+        # Кнопка карты зависимостей
+        self.map_btn = ctk.CTkButton(
+            self, text="🗺 Карта зависимостей",
+            fg_color="#6d28d9", hover_color="#5b21b6",
+            font=("Roboto", 13, "bold"), height=38,
+            command=self.show_dependency_map
+        )
 
-        self.up_btn = ctk.CTkButton(self.docker_btns_frame, text="▶️ Поднять", fg_color="#007bff", hover_color="#0056b3", height=40, command=self.docker_up)
-        self.up_btn.pack(side="left", expand=True, padx=5)
-
-        self.down_btn = ctk.CTkButton(self.docker_btns_frame, text="⏹ Остановить", fg_color="#dc3545", hover_color="#c82333", height=40, command=self.docker_down)
-        self.down_btn.pack(side="right", expand=True, padx=5)
-        
-        self.docker_frame.pack_forget()
-
-        # --- НАСТОЯЩИЙ ТЕРМИНАЛ ---
-        # Черный фон, маковский терминальный шрифт Menlo
-        self.log_view = ctk.CTkTextbox(self, font=("Menlo", 12), text_color="#FFFFFF", fg_color="#000000", border_color="#333333", border_width=2)
+        # --- Терминал ---
+        self.log_view = ctk.CTkTextbox(self, font=("Menlo", 12), text_color="#FFFFFF",
+                                       fg_color="#000000", border_color="#333333", border_width=2)
         self.log_view.pack(padx=20, pady=10, fill="both", expand=True)
         self.log_view.configure(state="disabled")
+        self.log_view.tag_config("error",   foreground="#FF4C4C")
+        self.log_view.tag_config("success", foreground="#00FF00")
+        self.log_view.tag_config("info",    foreground="#5DADE2")
+        self.log_view.tag_config("warning", foreground="#F4D03F")
+        self.log_view.tag_config("default", foreground="#F8F8F2")
 
-        # Настраиваем цветовые теги для эмуляции подсветки терминала
-        self.log_view.tag_config("error", foreground="#FF4C4C")      # Красный
-        self.log_view.tag_config("success", foreground="#00FF00")    # Ярко-зеленый
-        self.log_view.tag_config("info", foreground="#5DADE2")       # Голубой
-        self.log_view.tag_config("warning", foreground="#F4D03F")    # Желтый
-        self.log_view.tag_config("default", foreground="#F8F8F2")    # Стандартный бело-серый
-
+        self.source_path = ""
         self.final_output_path = ""
+        self.scan_result = None
         sys.stdout = self
 
-    def toggle_output_input(self):
-        if self.use_default_output.get():
-            self.custom_output_frame.pack_forget()
-        else:
-            self.custom_output_frame.pack(padx=40, pady=5, fill="x")
+    # ------------------------------------------------------------------ #
+    #  Утилиты                                                             #
+    # ------------------------------------------------------------------ #
 
     def browse_source(self):
         d = filedialog.askdirectory()
@@ -118,106 +114,266 @@ class AMMApp(ctk.CTk):
             self.path_entry.delete(0, "end")
             self.path_entry.insert(0, d)
 
-    def browse_output(self):
-        d = filedialog.askdirectory()
-        if d:
-            self.out_path_entry.delete(0, "end")
-            self.out_path_entry.insert(0, d)
-
     def write(self, txt):
-        """Перехват принтов и умная раскраска логов терминала"""
         self.log_view.configure(state="normal")
-        
-        # Эвристика раскраски текста
         if any(w in txt for w in ["❌", "Ошибка", "ERROR", "failed", "Traceback", "Exception"]):
-            self.log_view.insert("end", txt, "error")
+            tag = "error"
         elif any(w in txt for w in ["✅", "Успешно", "Success", "Healthy"]):
-            self.log_view.insert("end", txt, "success")
+            tag = "success"
         elif any(w in txt for w in ["🐳", "▶️", "🛑", "---", "Building", "Status", "Container"]):
-            self.log_view.insert("end", txt, "info")
+            tag = "info"
         elif any(w in txt for w in ["WARN", "Warning", "⚠️"]):
-            self.log_view.insert("end", txt, "warning")
+            tag = "warning"
         else:
-            self.log_view.insert("end", txt, "default")
-            
+            tag = "default"
+        self.log_view.insert("end", txt, tag)
         self.log_view.see("end")
         self.log_view.configure(state="disabled")
 
     def flush(self): pass
 
-    def start_migration(self):
-        source_path = self.path_entry.get()
+    def _clear_log(self):
+        self.log_view.configure(state="normal")
+        self.log_view.delete("1.0", "end")
+        self.log_view.configure(state="disabled")
+
+    def _hide_action_buttons(self):
+        self.generate_btn.pack_forget()
+        self.regen_btn.pack_forget()
+        self.docker_frame.pack_forget()
+        self.map_btn.pack_forget()
+
+    def _show_after_generation(self):
+        """Показывает полный набор кнопок после успешной генерации."""
+        self.generate_btn.pack_forget()
+        self.regen_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
+        self.docker_frame.pack(padx=40, pady=5, fill="x", before=self.log_view)
+        self.map_btn.pack(padx=40, pady=(0, 5), fill="x", before=self.log_view)
+
+    def _show_after_scan_with_output(self):
+        """docker_out найден — генерация не нужна, сразу показываем Docker-кнопки."""
+        self.generate_btn.pack_forget()
+        self.regen_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
+        self.docker_frame.pack(padx=40, pady=5, fill="x", before=self.log_view)
+        self.map_btn.pack(padx=40, pady=(0, 5), fill="x", before=self.log_view)
+
+    def _show_after_scan_no_output(self):
+        """docker_out не найден — предлагаем сгенерировать."""
+        self.regen_btn.pack_forget()
+        self.docker_frame.pack_forget()
+        self.generate_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
+        self.map_btn.pack(padx=40, pady=(0, 5), fill="x", before=self.log_view)
+
+    # ------------------------------------------------------------------ #
+    #  Сканирование                                                        #
+    # ------------------------------------------------------------------ #
+
+    def start_scan(self):
+        source_path = self.path_entry.get().strip()
         if not source_path or not os.path.exists(source_path):
             messagebox.showerror("Ошибка", "Укажите верный путь к монолиту!")
             return
 
-        if self.use_default_output.get():
-            self.final_output_path = os.path.join(source_path, "docker_out")
-        else:
-            custom_out = self.out_path_entry.get()
-            if not custom_out:
-                messagebox.showerror("Ошибка", "Выберите папку для сохранения результата!")
-                return
-            self.final_output_path = os.path.join(custom_out, "docker_out")
+        self.source_path = source_path
+        self.final_output_path = os.path.join(source_path, "docker_out")
 
-        self.run_btn.configure(state="disabled", text="Анализ...")
-        self.docker_frame.pack_forget()
-        self.log_view.configure(state="normal")
-        self.log_view.delete("1.0", "end")
-        self.log_view.configure(state="disabled")
-        
-        threading.Thread(target=self.run_logic, args=(source_path, self.final_output_path), daemon=True).start()
+        self._hide_action_buttons()
+        self._clear_log()
+        self.scan_btn.configure(state="disabled", text="Сканирование...")
+        threading.Thread(target=self._run_scan, daemon=True).start()
 
-    def run_logic(self, src, out):
+    def _run_scan(self):
         try:
-            print(f"--- Старт миграции ---\nИсточник: {src}\nВывод: {out}\n")
-            generator.run_generation(src, out)
-            self.after(0, self.finish_success)
+            print(f"--- Сканирование монолита ---\n{self.source_path}\n")
+            result = scanner.scan_project_structure(self.source_path)
+            result['import_edges'] = scanner.analyze_import_graph(self.source_path, result['modules'])
+            self.scan_result = result
+            self.after(0, self._finish_scan)
         except Exception as e:
-            print(f"❌ Ошибка: {e}")
-            self.after(0, self.finish_error)
+            print(f"❌ Ошибка сканирования: {e}")
+            self.after(0, lambda: self.scan_btn.configure(state="normal", text="🔍 СКАНИРОВАТЬ"))
 
-    def finish_success(self):
-        self.run_btn.configure(state="normal", text="🔄 ПЕРЕГЕНЕРИРОВАТЬ")
-        self.docker_frame.pack(padx=40, pady=10, fill="x", before=self.log_view)
-        print("\n✅ Готово! Вы можете управлять Docker-контейнерами с помощью кнопок выше.")
+    def _finish_scan(self):
+        self.scan_btn.configure(state="normal", text="🔍 СКАНИРОВАТЬ")
 
-    def finish_error(self):
-        self.run_btn.configure(state="normal", text="ЗАПУСТИТЬ МИГРАЦИЮ")
+        modules  = self.scan_result.get('modules', [])
+        services = [m for m in modules if m['type'] == 'service']
+        shared   = [m for m in modules if m['type'] == 'shared']
+        edges    = self.scan_result.get('import_edges', [])
+
+        print(f"✅ Найдено: {len(services)} сервис(ов), {len(shared)} shared-библиотек, {len(edges)} связей\n")
+        for m in modules:
+            icon = "🚀" if m['type'] == 'service' else "📚"
+            print(f"  {icon} {m['name']}  ({m['files_count']} .py файлов)")
+
+        if os.path.exists(self.final_output_path):
+            print(f"\n📦 Найдена папка docker_out — контейнеры готовы к запуску.")
+            self._show_after_scan_with_output()
+        else:
+            print(f"\n⚙️ Папка docker_out не найдена — нажмите «Генерировать».")
+            self._show_after_scan_no_output()
+
+    # ------------------------------------------------------------------ #
+    #  Генерация / Перегенерация                                          #
+    # ------------------------------------------------------------------ #
+
+    def start_generation(self):
+        if not self.source_path or not os.path.exists(self.source_path):
+            messagebox.showerror("Ошибка", "Сначала выполните сканирование!")
+            return
+
+        self._hide_action_buttons()
+        self.scan_btn.configure(state="disabled")
+        self._clear_log()
+        threading.Thread(target=self._run_generation, daemon=True).start()
+
+    def _run_generation(self):
+        try:
+            print(f"--- Генерация Docker-артефактов ---\nВывод: {self.final_output_path}\n")
+            self.scan_result = generator.run_generation(self.source_path, self.final_output_path)
+            self.after(0, self._finish_generation)
+        except Exception as e:
+            print(f"❌ Ошибка генерации: {e}")
+            self.after(0, self._finish_generation_error)
+
+    def _finish_generation(self):
+        self.scan_btn.configure(state="normal")
+        self._show_after_generation()
+        print("\n✅ Готово! Запустите контейнеры кнопкой «Поднять».")
+
+    def _finish_generation_error(self):
+        self.scan_btn.configure(state="normal")
+        # Возвращаем кнопку генерации, чтобы пользователь мог повторить
+        self.generate_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
+
+    # ------------------------------------------------------------------ #
+    #  Карта зависимостей                                                 #
+    # ------------------------------------------------------------------ #
+
+    def show_dependency_map(self):
+        if not self.scan_result:
+            messagebox.showinfo("Карта зависимостей", "Сначала выполните сканирование!")
+            return
+
+        modules = self.scan_result.get('modules', [])
+        edges   = self.scan_result.get('import_edges', [])
+
+        if not modules:
+            messagebox.showinfo("Карта зависимостей", "Модули не найдены.")
+            return
+
+        win = ctk.CTkToplevel(self)
+        win.title("Карта зависимостей")
+        win.geometry("720x520")
+        win.resizable(True, True)
+
+        canvas = tkinter.Canvas(win, bg="#0f172a", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+
+        services = [m for m in modules if m['type'] == 'service']
+        shared   = [m for m in modules if m['type'] == 'shared']
+        W, H, BOX_W, BOX_H = 720, 520, 110, 36
+
+        def box_x(i, total):
+            return (i + 1) * W / (total + 1)
+
+        positions = {}
+        for i, svc in enumerate(services):
+            x, y = box_x(i, len(services)), 130
+            positions[svc['name']] = (x, y)
+            canvas.create_rectangle(x - BOX_W//2, y - BOX_H//2, x + BOX_W//2, y + BOX_H//2,
+                                    fill="#1d4ed8", outline="#60a5fa", width=2)
+            canvas.create_text(x, y, text=svc['name'], fill="white", font=("Menlo", 10, "bold"))
+
+        for i, sh in enumerate(shared):
+            x, y = box_x(i, len(shared)), 370
+            positions[sh['name']] = (x, y)
+            canvas.create_rectangle(x - BOX_W//2, y - BOX_H//2, x + BOX_W//2, y + BOX_H//2,
+                                    fill="#374151", outline="#9ca3af", width=2)
+            canvas.create_text(x, y, text=sh['name'], fill="#e5e7eb", font=("Menlo", 10))
+
+        for edge in edges:
+            s, d = edge['from'], edge['to']
+            if s not in positions or d not in positions:
+                continue
+            x1, y1 = positions[s]
+            x2, y2 = positions[d]
+            dy1 = BOX_H // 2 if y2 > y1 else -BOX_H // 2
+            dy2 = -BOX_H // 2 if y2 > y1 else BOX_H // 2
+            canvas.create_line(x1, y1 + dy1, x2, y2 + dy2,
+                               arrow="last", fill="#f59e0b", width=2, arrowshape=(10, 12, 4))
+
+        canvas.create_rectangle(16, H - 70, 185, H - 10, fill="#1e293b", outline="#334155")
+        canvas.create_rectangle(26, H - 58, 50, H - 42, fill="#1d4ed8", outline="#60a5fa")
+        canvas.create_text(57, H - 50, anchor="w", text="Сервис", fill="white", font=("Menlo", 9))
+        canvas.create_rectangle(26, H - 36, 50, H - 20, fill="#374151", outline="#9ca3af")
+        canvas.create_text(57, H - 28, anchor="w", text="Shared-библиотека", fill="white", font=("Menlo", 9))
+
+        canvas.create_text(W // 2, 40, text="Карта зависимостей микросервисов",
+                           fill="#e2e8f0", font=("Menlo", 14, "bold"))
+        canvas.create_text(W // 2, 65,
+                           text=f"{len(services)} сервис(ов)  •  {len(shared)} shared  •  {len(edges)} связей",
+                           fill="#64748b", font=("Menlo", 10))
+
+    # ------------------------------------------------------------------ #
+    #  Docker                                                              #
+    # ------------------------------------------------------------------ #
 
     def docker_up(self):
-        print("\n🐳 Запуск контейнеров в фоновом режиме (Up)...")
-        threading.Thread(target=self.run_subprocess, args=(["docker", "compose", "up", "-d", "--build"],), daemon=True).start()
+        if not self.final_output_path or not os.path.exists(self.final_output_path):
+            messagebox.showerror("Ошибка", "Папка docker_out не найдена. Выполните генерацию.")
+            return
+        print("\n🐳 Запуск контейнеров (Up)...")
+        threading.Thread(
+            target=self.run_subprocess,
+            args=(["docker", "compose", "up", "-d", "--build"],),
+            kwargs={"on_success": self._open_browser},
+            daemon=True
+        ).start()
 
     def docker_down(self):
-        print("\n🛑 Остановка и удаление контейнеров (Down)...")
-        threading.Thread(target=self.run_subprocess, args=(["docker", "compose", "down", "-v"],), daemon=True).start()
+        if not self.final_output_path or not os.path.exists(self.final_output_path):
+            messagebox.showerror("Ошибка", "Папка docker_out не найдена.")
+            return
+        print("\n🛑 Остановка контейнеров (Down)...")
+        threading.Thread(target=self.run_subprocess,
+                         args=(["docker", "compose", "down", "-v"],), daemon=True).start()
 
-    def run_subprocess(self, command):
+    def _open_browser(self):
+        url = "http://localhost:8888"
+        print(f"🌐 Ожидаю готовности API Gateway ({url})...")
+        for _ in range(30):
+            try:
+                urllib.request.urlopen(url, timeout=1)
+                print(f"✅ Шлюз готов! Открываю браузер...\n")
+                webbrowser.open(url)
+                return
+            except Exception:
+                time.sleep(1)
+        print(f"⚠️ Шлюз не ответил за 30 секунд. Откройте вручную: {url}\n")
+
+    def run_subprocess(self, command, on_success=None):
         try:
             mac_env = os.environ.copy()
             mac_env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:" + mac_env.get("PATH", "")
-
             process = subprocess.Popen(
-                command, 
-                cwd=self.final_output_path, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                text=True,
-                env=mac_env
+                command, cwd=self.final_output_path,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=mac_env
             )
             for line in process.stdout:
                 print(line, end="")
             process.wait()
-            
             if process.returncode == 0:
-                print("✅ Операция Docker успешно завершена.\n")
+                print("✅ Операция Docker завершена.\n")
+                if on_success:
+                    on_success()
             else:
                 print(f"❌ Команда завершилась с кодом {process.returncode}\n")
         except Exception as e:
-            print(f"❌ Ошибка выполнения Docker: {e}\nУбедитесь, что Docker Desktop запущен.")
+            print(f"❌ Ошибка Docker: {e}\nУбедитесь, что Docker Desktop запущен.")
+
 
 if __name__ == "__main__":
     app = AMMApp()
     app.mainloop()
-

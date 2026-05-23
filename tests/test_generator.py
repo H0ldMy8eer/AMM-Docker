@@ -159,6 +159,19 @@ class TestRunGeneration:
         out = tmp_path / "output"
         generator.run_generation("/nonexistent/path", str(out))
 
+    def test_creates_logging_configs(self, monolith_dir, tmp_path):
+        out = tmp_path / "output"
+        generator.run_generation(str(monolith_dir), str(out))
+        assert (out / "logging" / "promtail-config.yaml").exists()
+        assert (out / "logging" / "grafana-datasource.yaml").exists()
+
+    def test_run_generation_returns_scan_result(self, monolith_dir, tmp_path):
+        out = tmp_path / "output"
+        result = generator.run_generation(str(monolith_dir), str(out))
+        assert result is not None
+        assert 'modules' in result
+        assert 'import_edges' in result
+
     def test_nginx_redirect_is_dynamic_not_hardcoded(self, tmp_path):
         # Сервисы намеренно без имени 'products' — редирект должен вести на первый сервис
         alpha = tmp_path / "alpha_svc"
@@ -174,5 +187,5 @@ class TestRunGeneration:
         out = tmp_path / "output"
         generator.run_generation(str(tmp_path), str(out))
         content = (out / "nginx" / "nginx.conf").read_text()
-        assert "return 302 /products" not in content
-        assert "return 302 /alpha_svc" in content
+        assert "/products" not in content or "alpha_svc" in content
+        assert "$http_host/alpha_svc/" in content

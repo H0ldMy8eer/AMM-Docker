@@ -32,7 +32,8 @@ class TestNginxTemplate:
 
     def test_redirect_goes_to_first_service(self, jinja_env, two_services):
         content = jinja_env.get_template("nginx.conf.jinja2").render(services=two_services)
-        assert "return 302 /users" in content
+        # Редирект должен сохранять порт через $http_host
+        assert "return 302 $scheme://$http_host/users/" in content
 
     def test_redirect_follows_first_service_name(self, jinja_env):
         services = [
@@ -40,8 +41,14 @@ class TestNginxTemplate:
             {'name': 'orders', 'type': 'service'},
         ]
         content = jinja_env.get_template("nginx.conf.jinja2").render(services=services)
-        assert "return 302 /inventory" in content
-        assert "return 302 /orders" not in content
+        assert "return 302 $scheme://$http_host/inventory/" in content
+        assert "return 302 $scheme://$http_host/orders/" not in content
+
+    def test_redirect_preserves_port_via_http_host(self, jinja_env, two_services):
+        content = jinja_env.get_template("nginx.conf.jinja2").render(services=two_services)
+        # $http_host включает порт (localhost:8888), $host — нет
+        assert "$http_host" in content
+        assert "return 302 /users" not in content  # голый путь теряет порт
 
     def test_no_hardcoded_products_redirect(self, jinja_env):
         services = [{'name': 'catalog', 'type': 'service'}]
@@ -67,7 +74,7 @@ class TestNginxTemplate:
         services = [{'name': 'api', 'type': 'service'}]
         content = jinja_env.get_template("nginx.conf.jinja2").render(services=services)
         assert "location /api" in content
-        assert "return 302 /api" in content
+        assert "return 302 $scheme://$http_host/api/" in content
 
 
 class TestDockerComposeTemplate:

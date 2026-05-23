@@ -62,5 +62,39 @@ def scan_project_structure(root_path):
 
     return project_map
 
+def analyze_import_graph(root_path, modules):
+    """Строит граф импортов: какой модуль импортирует какой другой модуль."""
+    module_names = [m['name'] for m in modules]
+    edges = []
+    seen = set()
+
+    for module in modules:
+        module_path = os.path.join(root_path, module['path'])
+        if not os.path.isdir(module_path):
+            continue
+
+        for dirpath, _, filenames in os.walk(module_path):
+            for filename in filenames:
+                if not filename.endswith('.py'):
+                    continue
+                try:
+                    with open(os.path.join(dirpath, filename), 'r', encoding='utf-8') as f:
+                        content = f.read()
+                except Exception:
+                    continue
+
+                for target in module_names:
+                    if target == module['name']:
+                        continue
+                    edge = (module['name'], target)
+                    if edge in seen:
+                        continue
+                    if f'import {target}' in content or f'from {target}' in content:
+                        edges.append({'from': module['name'], 'to': target})
+                        seen.add(edge)
+
+    return edges
+
+
 if __name__ == "__main__":
     pass
