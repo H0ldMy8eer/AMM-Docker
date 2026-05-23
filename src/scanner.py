@@ -43,7 +43,7 @@ def scan_project_structure(root_path):
             deps = parse_requirements(full_req_path)
             project_map["dependencies"][rel_path] = deps
 
-        if depth == 1 and rel_path != ".":
+        if depth == 0 and rel_path != ".":
             py_files = [f for f in filenames if f.endswith(".py")]
             
             if py_files:
