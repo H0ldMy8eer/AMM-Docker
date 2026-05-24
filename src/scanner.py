@@ -1,5 +1,5 @@
 import os
-import re
+import ast
 
 SERVICE_FILES = {"routes.py", "views.py", "api.py", "handlers.py", "endpoints.py", "resources.py"}
 IGNORE_DIRS = {'__pycache__', 'venv', 'env', 'node_modules', 'instance', 'migrations',
@@ -23,45 +23,140 @@ def parse_requirements(file_path):
         return []
 
 
-def _extract_all_blueprints(fpath):
-    """Возвращает {var_name: {'url_prefix': ...}} для ВСЕХ Blueprint в файле."""
-    try:
-        with open(fpath, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception:
-        return {}
+# ─────────────────────────────────────────────────────────────────────────────
+# AST helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    if 'Blueprint(' not in content:
+def _parse_ast(fpath):
+    """Parse a Python source file into an AST. Returns None on any failure."""
+    try:
+        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+            source = f.read()
+        return ast.parse(source, filename=fpath)
+    except Exception:
+        return None
+
+
+def _is_blueprint_call(node):
+    """True if node is a Call to Blueprint (bare name or attribute access)."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        (isinstance(func, ast.Name) and func.id == 'Blueprint') or
+        (isinstance(func, ast.Attribute) and func.attr == 'Blueprint')
+    )
+
+
+def _extract_str(node):
+    """Return the string value of an AST Constant node, or None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _extract_blueprints_ast(fpath):
+    """
+    Return {var_name: {'url_prefix': str|None}} for every Blueprint assignment
+    found in the file.
+
+    Handles:
+      - bp = Blueprint(...)
+      - bp: Blueprint = Blueprint(...)
+      - bp = flask.Blueprint(...)
+
+    Not fooled by commented-out code, string literals, or multi-line calls.
+    """
+    tree = _parse_ast(fpath)
+    if tree is None:
         return {}
 
     results = {}
-    for m in re.finditer(r'(\w+)\s*=\s*Blueprint\s*\(([^)]*)\)', content, re.DOTALL):
-        var_name = m.group(1)
-        args_str = m.group(2)
-        prefix_m = re.search(r"url_prefix\s*=\s*['\"]([^'\"]+)['\"]", args_str)
-        url_prefix = prefix_m.group(1) if prefix_m else None
+
+    for node in ast.walk(tree):
+        call = None
+        var_name = None
+
+        # bp = Blueprint(...)
+        if isinstance(node, ast.Assign) and _is_blueprint_call(node.value):
+            call = node.value
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    var_name = target.id
+                    break
+
+        # bp: Blueprint = Blueprint(...)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and _is_blueprint_call(node.value)
+            and isinstance(node.target, ast.Name)
+        ):
+            call = node.value
+            var_name = node.target.id
+
+        if call is None or var_name is None:
+            continue
+
+        url_prefix = None
+        for kw in call.keywords:
+            if kw.arg == 'url_prefix':
+                url_prefix = _extract_str(kw.value)
+                break
+
         results[var_name] = {'url_prefix': url_prefix}
+
     return results
 
 
+def _collect_imports_ast(fpath):
+    """
+    Return the set of top-level module names imported in a file.
+
+    Handles:
+      - import X           → 'X'
+      - import X.Y.Z       → 'X'
+      - from X import Y    → 'X'
+      - from X.Y import Z  → 'X'
+
+    Ignores relative imports (level > 0) to avoid false edges within a package.
+    """
+    tree = _parse_ast(fpath)
+    if tree is None:
+        return set()
+
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.level == 0:
+                imported.add(node.module.split('.')[0])
+    return imported
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Directory-level helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _is_service_dir(dirpath, filenames):
-    py_files = [f for f in filenames if f.endswith(".py")]
-    if not py_files:
+    """
+    A directory is a 'service' if it contains a known service filename
+    (routes.py, views.py, …) OR if any .py file defines a Blueprint.
+    """
+    if not any(f.endswith('.py') for f in filenames):
         return False
     if any(f in SERVICE_FILES for f in filenames):
         return True
-    for py_file in py_files:
-        try:
-            with open(os.path.join(dirpath, py_file), 'r', encoding='utf-8') as fh:
-                if 'Blueprint(' in fh.read():
-                    return True
-        except Exception:
-            pass
+    for fname in filenames:
+        if fname.endswith('.py') and _extract_blueprints_ast(os.path.join(dirpath, fname)):
+            return True
     return False
 
 
 def _service_name_from_var(var_name):
-    """auth_bp / auth_blueprint / AuthBlueprint → auth"""
+    """auth_bp / auth_blueprint / AuthBlueprint → 'auth'"""
     name = var_name.lower()
     for suffix in ('_blueprint', '_bp', 'blueprint', 'bp'):
         if name.endswith(suffix) and len(name) > len(suffix):
@@ -71,17 +166,23 @@ def _service_name_from_var(var_name):
 
 
 def _count_py_files(dirpath):
-    total = []
+    total = 0
     for _, _, files in os.walk(dirpath):
-        total.extend(f for f in files if f.endswith('.py'))
-    return len(total)
+        total += sum(1 for f in files if f.endswith('.py'))
+    return total
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
 
 def scan_project_structure(root_path):
     """
-    Сканирует монолит.
-    Если в папке несколько .py файлов с Blueprint — каждый становится отдельным сервисом
-    (автодекомпозиция). Иначе — папка целиком.
+    Scan a monolith project using AST analysis.
+
+    Auto-decomposition rule: if a directory has ≥2 Blueprint definitions
+    across its direct .py files, each Blueprint becomes its own microservice.
+    Otherwise the whole directory is treated as one service or shared library.
     """
     project_map = {
         "root": root_path,
@@ -93,7 +194,7 @@ def scan_project_structure(root_path):
     print(f"🔍 [SCANNER] Начинаю анализ монолита: {root_path}")
 
     candidates = []
-    per_file_container_dirs = set()  # директории, разбитые по-файлово
+    per_file_container_dirs = set()
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         dirnames[:] = [
@@ -102,6 +203,8 @@ def scan_project_structure(root_path):
         ]
 
         rel_path = os.path.relpath(dirpath, root_path)
+
+        # Root dir: only collect root requirements.txt
         if rel_path == '.':
             if "requirements.txt" in filenames:
                 project_map["dependencies"]['.'] = parse_requirements(
@@ -122,36 +225,31 @@ def scan_project_structure(root_path):
         if total_py_count == 0:
             continue
 
-        # Собираем Blueprint-определения из ВСЕХ .py файлов (включая __init__.py)
-        # Ключ: (fname, var_name) → {'url_prefix': ...}
+        # Collect Blueprint definitions from all direct .py files via AST
         all_bp_defs = {}
         container_name = rel_path.split(os.sep)[-1]
         for fname in filenames:
             if not fname.endswith('.py'):
                 continue
-            bps = _extract_all_blueprints(os.path.join(dirpath, fname))
+            bps = _extract_blueprints_ast(os.path.join(dirpath, fname))
             for var_name, info in bps.items():
                 all_bp_defs[(fname, var_name)] = info
 
         if len(all_bp_defs) >= 2:
-            # Несколько Blueprint-ов → автодекомпозиция по переменным
+            # Multiple Blueprints → auto-decompose each into its own service
             per_file_container_dirs.add(rel_path)
             print(f"   🔀 [DECOMPOSE] {rel_path}/ → {len(all_bp_defs)} сервисов")
 
             for (fname, var_name), info in all_bp_defs.items():
                 url_prefix = info['url_prefix']
-                # Имя сервиса: из url_prefix или из имени переменной
                 if url_prefix:
                     service_name = url_prefix.strip('/').split('/')[0]
                 else:
                     service_name = _service_name_from_var(var_name)
 
-                # import_path: из __init__.py → пакет целиком, иначе пакет.модуль
                 module_name = fname[:-3]
-                if module_name == '__init__':
-                    import_path = container_name
-                else:
-                    import_path = f"{container_name}.{module_name}"
+                import_path = container_name if module_name == '__init__' \
+                    else f"{container_name}.{module_name}"
 
                 candidates.append({
                     'name_override': service_name,
@@ -169,19 +267,18 @@ def scan_project_structure(root_path):
             py_files = [f for f in filenames if f.endswith(".py")]
             if not py_files:
                 continue
-            is_service = _is_service_dir(dirpath, filenames)
             candidates.append({
                 'rel_path': rel_path,
                 'dirpath': dirpath,
                 'depth': depth,
                 'total_py_count': total_py_count,
-                'is_service': is_service,
+                'is_service': _is_service_dir(dirpath, filenames),
             })
 
-    # Второй проход: строим список модулей без дублирования
-    claimed_prefixes = set()
+    # ── Second pass: deduplicate and build module list ──────────────────────
 
-    # Предки глубоких сервисов (не per-file) → помечаем как контейнеры
+    # Parent directories of nested services are just containers — don't add them
+    claimed_prefixes = set()
     for c in candidates:
         if c['is_service'] and c['depth'] > 0 and 'module_file' not in c:
             parts = c['rel_path'].split(os.sep)
@@ -192,11 +289,11 @@ def scan_project_structure(root_path):
         rel_path = c['rel_path']
         is_service = c['is_service']
 
-        # Пропустить директорию-контейнер для per-file (сами файлы будут добавлены)
+        # Skip the container directory when per-file decomposition applies
         if rel_path in per_file_container_dirs and 'module_file' not in c:
             continue
 
-        # Пропустить родительскую папку-контейнер для вложенных сервисов
+        # Skip non-service parent containers
         if rel_path in claimed_prefixes and not is_service:
             continue
 
@@ -220,7 +317,6 @@ def scan_project_structure(root_path):
             "files_count": c['total_py_count'],
         }
 
-        # Добавляем метаданные для per-file blueprints
         if 'module_file' in c:
             module['module_file'] = c['module_file']
             module['import_path'] = c['import_path']
@@ -237,8 +333,13 @@ def scan_project_structure(root_path):
 
 
 def analyze_import_graph(root_path, modules):
-    """Строит граф импортов между модулями."""
-    module_names = [m['name'] for m in modules]
+    """
+    Build an import graph between modules using AST.
+
+    Only absolute imports are considered; relative imports (level > 0) are
+    ignored to avoid intra-package false edges.
+    """
+    module_names = {m['name'] for m in modules}
     edges = []
     seen = set()
 
@@ -251,21 +352,18 @@ def analyze_import_graph(root_path, modules):
             for filename in filenames:
                 if not filename.endswith('.py'):
                     continue
-                try:
-                    with open(os.path.join(dirpath, filename), 'r', encoding='utf-8') as f:
-                        content = f.read()
-                except Exception:
-                    continue
+                imported = _collect_imports_ast(os.path.join(dirpath, filename))
 
-                for target in module_names:
-                    if target == module['name']:
+                for target_name in imported:
+                    if target_name == module['name']:
                         continue
-                    edge = (module['name'], target)
+                    if target_name not in module_names:
+                        continue
+                    edge = (module['name'], target_name)
                     if edge in seen:
                         continue
-                    if f'import {target}' in content or f'from {target}' in content:
-                        edges.append({'from': module['name'], 'to': target})
-                        seen.add(edge)
+                    edges.append({'from': module['name'], 'to': target_name})
+                    seen.add(edge)
 
     return edges
 
