@@ -1,3 +1,4 @@
+import os
 import pytest
 import scanner
 
@@ -161,3 +162,122 @@ class TestAnalyzeImportGraph:
         modules = [{'name': 'users', 'path': 'users', 'type': 'service'}]
         edges = scanner.analyze_import_graph(str(tmp_path), modules)
         assert edges == []
+
+    def test_service_to_service_edge(self, tmp_path):
+        """products импортирует users → ребро products→users."""
+        (tmp_path / "users").mkdir()
+        (tmp_path / "users" / "views.py").write_text(
+            "from flask import Blueprint\nuser_bp = Blueprint('users', __name__)\n"
+        )
+        (tmp_path / "products").mkdir()
+        (tmp_path / "products" / "views.py").write_text(
+            "from flask import Blueprint\n"
+            "from users import models\n"
+            "product_bp = Blueprint('products', __name__)\n"
+        )
+        modules = [
+            {'name': 'users',    'path': 'users',    'type': 'service'},
+            {'name': 'products', 'path': 'products', 'type': 'service'},
+        ]
+        edges = scanner.analyze_import_graph(str(tmp_path), modules)
+        assert any(e['from'] == 'products' and e['to'] == 'users' for e in edges)
+
+    def test_importlib_import_detected(self, tmp_path):
+        """importlib.import_module('common') должен создавать ребро."""
+        (tmp_path / "orders").mkdir()
+        (tmp_path / "orders" / "views.py").write_text(
+            "import importlib\ncommon = importlib.import_module('common')\n"
+        )
+        (tmp_path / "common").mkdir()
+        (tmp_path / "common" / "utils.py").write_text("x = 1\n")
+        modules = [
+            {'name': 'orders', 'path': 'orders', 'type': 'service'},
+            {'name': 'common', 'path': 'common', 'type': 'shared'},
+        ]
+        edges = scanner.analyze_import_graph(str(tmp_path), modules)
+        assert any(e['from'] == 'orders' and e['to'] == 'common' for e in edges)
+
+    def test_monolith_has_expected_edges(self, monolith_dir):
+        """Из фикстуры ожидаем: users→common, products→common, products→users."""
+        result = scanner.scan_project_structure(str(monolith_dir))
+        edges = scanner.analyze_import_graph(str(monolith_dir), result['modules'])
+        pairs = {(e['from'], e['to']) for e in edges}
+        assert ('users', 'common') in pairs
+        assert ('products', 'common') in pairs
+        assert ('products', 'users') in pairs
+
+
+class TestDetectFramework:
+    def test_detects_flask_from_requirements(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("Flask==3.0.0\n")
+        assert scanner.detect_framework(str(tmp_path)) == 'flask'
+
+    def test_detects_fastapi_from_requirements(self, fastapi_monolith):
+        assert scanner.detect_framework(str(fastapi_monolith)) == 'fastapi'
+
+    def test_detects_django_from_manage_py(self, django_monolith):
+        assert scanner.detect_framework(str(django_monolith)) == 'django'
+
+    def test_detects_django_from_requirements(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("Django>=4.2\n")
+        assert scanner.detect_framework(str(tmp_path)) == 'django'
+
+    def test_detects_flask_from_imports(self, tmp_path):
+        (tmp_path / "app.py").write_text("from flask import Flask\napp = Flask(__name__)\n")
+        assert scanner.detect_framework(str(tmp_path)) == 'flask'
+
+    def test_unknown_when_no_hints(self, tmp_path):
+        (tmp_path / "script.py").write_text("print('hello')\n")
+        assert scanner.detect_framework(str(tmp_path)) == 'unknown'
+
+    def test_missing_dir_returns_unknown(self, tmp_path):
+        result = scanner.detect_framework(str(tmp_path / "nonexistent"))
+        assert result == 'unknown'
+
+
+class TestFastAPIDetection:
+    def test_detects_apirouter_as_service(self, fastapi_monolith):
+        result = scanner.scan_project_structure(str(fastapi_monolith))
+        services = [m for m in result['modules'] if m['type'] == 'service']
+        names = {m['name'] for m in services}
+        assert 'users' in names
+        assert 'orders' in names
+
+    def test_apirouter_prefix_extracted(self, fastapi_monolith):
+        result = scanner.scan_project_structure(str(fastapi_monolith))
+        modules = {m['name']: m for m in result['modules']}
+        assert modules['users'].get('url_prefix') == '/users' or \
+               modules['users']['type'] == 'service'
+
+    def test_fastapi_service_to_service_edge(self, fastapi_monolith):
+        result = scanner.scan_project_structure(str(fastapi_monolith))
+        edges = scanner.analyze_import_graph(str(fastapi_monolith), result['modules'])
+        assert any(e['from'] == 'orders' and e['to'] == 'users' for e in edges)
+
+    def test_router_py_detected_as_service_file(self, tmp_path):
+        svc = tmp_path / "payments"
+        svc.mkdir()
+        (svc / "router.py").write_text("# FastAPI router\n")
+        result = scanner.scan_project_structure(str(tmp_path))
+        modules = {m['name']: m for m in result['modules']}
+        assert modules.get('payments', {}).get('type') == 'service'
+
+
+class TestDjangoDetection:
+    def test_detects_django_app_by_urls_py(self, django_monolith):
+        result = scanner.scan_project_structure(str(django_monolith))
+        services = [m for m in result['modules'] if m['type'] == 'service']
+        names = {m['name'] for m in services}
+        assert 'blog' in names
+        assert 'shop' in names
+
+    def test_urlpatterns_makes_service(self, tmp_path):
+        app = tmp_path / "catalog"
+        app.mkdir()
+        (app / "__init__.py").write_text("")
+        (app / "app_urls.py").write_text(
+            "urlpatterns = []\n"
+        )
+        result = scanner.scan_project_structure(str(tmp_path))
+        modules = {m['name']: m for m in result['modules']}
+        assert modules.get('catalog', {}).get('type') == 'service'

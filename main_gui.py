@@ -54,8 +54,13 @@ class AMMApp(ctk.CTk):
         )
         self.scan_btn.pack(padx=40, pady=10, fill="x")
 
+        # --- Прогресс-бар (скрыт по умолчанию) ---
+        self.progress_bar = ctk.CTkProgressBar(self, mode="indeterminate", height=6)
+        self.progress_label = ctk.CTkLabel(
+            self, text="", font=("Roboto", 11), text_color="#5DADE2"
+        )
+
         # --- Динамические кнопки (появляются после сканирования) ---
-        # Кнопка генерации (если docker_out не найден)
         self.generate_btn = ctk.CTkButton(
             self, text="⚙️ ГЕНЕРИРОВАТЬ",
             fg_color="#28a745", hover_color="#218838",
@@ -63,7 +68,6 @@ class AMMApp(ctk.CTk):
             command=self.start_generation
         )
 
-        # Кнопка перегенерации (если docker_out уже есть или после генерации)
         self.regen_btn = ctk.CTkButton(
             self, text="🔄 ПЕРЕГЕНЕРИРОВАТЬ",
             fg_color="#5c636a", hover_color="#494f54",
@@ -154,7 +158,6 @@ class AMMApp(ctk.CTk):
         self.delete_btn.pack_forget()
 
     def _show_after_generation(self):
-        """Показывает полный набор кнопок после успешной генерации."""
         self.generate_btn.pack_forget()
         self.regen_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
         self.docker_frame.pack(padx=40, pady=5, fill="x", before=self.log_view)
@@ -162,7 +165,6 @@ class AMMApp(ctk.CTk):
         self.delete_btn.pack(padx=40, pady=(0, 8), fill="x", before=self.log_view)
 
     def _show_after_scan_with_output(self):
-        """docker_out найден — генерация не нужна, сразу показываем Docker-кнопки."""
         self.generate_btn.pack_forget()
         self.regen_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
         self.docker_frame.pack(padx=40, pady=5, fill="x", before=self.log_view)
@@ -170,12 +172,29 @@ class AMMApp(ctk.CTk):
         self.delete_btn.pack(padx=40, pady=(0, 8), fill="x", before=self.log_view)
 
     def _show_after_scan_no_output(self):
-        """docker_out не найден — предлагаем сгенерировать."""
         self.regen_btn.pack_forget()
         self.docker_frame.pack_forget()
         self.delete_btn.pack_forget()
         self.generate_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
         self.map_btn.pack(padx=40, pady=(0, 5), fill="x", before=self.log_view)
+
+    # ------------------------------------------------------------------ #
+    #  Прогресс-бар                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _show_progress(self, message=""):
+        """Показывает анимированный прогресс-бар под кнопкой сканирования."""
+        if message:
+            self.progress_label.configure(text=message)
+            self.progress_label.pack(padx=40, pady=(0, 2), before=self.log_view)
+        self.progress_bar.pack(padx=40, pady=(0, 6), fill="x", before=self.log_view)
+        self.progress_bar.start()
+
+    def _hide_progress(self):
+        """Скрывает прогресс-бар."""
+        self.progress_bar.stop()
+        self.progress_bar.pack_forget()
+        self.progress_label.pack_forget()
 
     # ------------------------------------------------------------------ #
     #  Сканирование                                                        #
@@ -193,6 +212,7 @@ class AMMApp(ctk.CTk):
         self._hide_action_buttons()
         self._clear_log()
         self.scan_btn.configure(state="disabled", text="Сканирование...")
+        self._show_progress("Анализ структуры проекта...")
         threading.Thread(target=self._run_scan, daemon=True).start()
 
     def _run_scan(self):
@@ -204,9 +224,10 @@ class AMMApp(ctk.CTk):
             self.after(0, self._finish_scan)
         except Exception as e:
             print(f"❌ Ошибка сканирования: {e}")
-            self.after(0, lambda: self.scan_btn.configure(state="normal", text="🔍 СКАНИРОВАТЬ"))
+            self.after(0, self._finish_scan_error)
 
     def _finish_scan(self):
+        self._hide_progress()
         self.scan_btn.configure(state="normal", text="🔍 СКАНИРОВАТЬ")
 
         modules  = self.scan_result.get('modules', [])
@@ -226,6 +247,10 @@ class AMMApp(ctk.CTk):
             print(f"\n⚙️ Папка docker_out не найдена — нажмите «Генерировать».")
             self._show_after_scan_no_output()
 
+    def _finish_scan_error(self):
+        self._hide_progress()
+        self.scan_btn.configure(state="normal", text="🔍 СКАНИРОВАТЬ")
+
     # ------------------------------------------------------------------ #
     #  Генерация / Перегенерация                                          #
     # ------------------------------------------------------------------ #
@@ -238,6 +263,7 @@ class AMMApp(ctk.CTk):
         self._hide_action_buttons()
         self.scan_btn.configure(state="disabled")
         self._clear_log()
+        self._show_progress("Генерация Docker-артефактов...")
         threading.Thread(target=self._run_generation, daemon=True).start()
 
     def _run_generation(self):
@@ -250,13 +276,14 @@ class AMMApp(ctk.CTk):
             self.after(0, self._finish_generation_error)
 
     def _finish_generation(self):
+        self._hide_progress()
         self.scan_btn.configure(state="normal")
         self._show_after_generation()
         print("\n✅ Готово! Запустите контейнеры кнопкой «Поднять».")
 
     def _finish_generation_error(self):
+        self._hide_progress()
         self.scan_btn.configure(state="normal")
-        # Возвращаем кнопку генерации, чтобы пользователь мог повторить
         self.generate_btn.pack(padx=40, pady=(8, 0), fill="x", before=self.log_view)
 
     # ------------------------------------------------------------------ #
@@ -277,7 +304,7 @@ class AMMApp(ctk.CTk):
 
         win = ctk.CTkToplevel(self)
         win.title("Карта зависимостей")
-        win.geometry("720x520")
+        win.geometry("760x540")
         win.resizable(True, True)
 
         canvas = tkinter.Canvas(win, bg="#0f172a", highlightthickness=0)
@@ -285,42 +312,74 @@ class AMMApp(ctk.CTk):
 
         services = [m for m in modules if m['type'] == 'service']
         shared   = [m for m in modules if m['type'] == 'shared']
-        W, H, BOX_W, BOX_H = 720, 520, 110, 36
+        W, H, BOX_W, BOX_H = 760, 540, 120, 36
 
-        def box_x(i, total):
+        def box_cx(i, total):
             return (i + 1) * W / (total + 1)
 
+        # Позиции центров блоков
         positions = {}
         for i, svc in enumerate(services):
-            x, y = box_x(i, len(services)), 130
+            x, y = box_cx(i, len(services)), 150
             positions[svc['name']] = (x, y)
-            canvas.create_rectangle(x - BOX_W//2, y - BOX_H//2, x + BOX_W//2, y + BOX_H//2,
-                                    fill="#1d4ed8", outline="#60a5fa", width=2)
-            canvas.create_text(x, y, text=svc['name'], fill="white", font=("Menlo", 10, "bold"))
+            canvas.create_rectangle(
+                x - BOX_W//2, y - BOX_H//2, x + BOX_W//2, y + BOX_H//2,
+                fill="#1d4ed8", outline="#60a5fa", width=2
+            )
+            canvas.create_text(x, y, text=svc['name'], fill="white",
+                               font=("Menlo", 10, "bold"))
 
         for i, sh in enumerate(shared):
-            x, y = box_x(i, len(shared)), 370
+            x, y = box_cx(i, len(shared)), 390
             positions[sh['name']] = (x, y)
-            canvas.create_rectangle(x - BOX_W//2, y - BOX_H//2, x + BOX_W//2, y + BOX_H//2,
-                                    fill="#374151", outline="#9ca3af", width=2)
-            canvas.create_text(x, y, text=sh['name'], fill="#e5e7eb", font=("Menlo", 10))
+            canvas.create_rectangle(
+                x - BOX_W//2, y - BOX_H//2, x + BOX_W//2, y + BOX_H//2,
+                fill="#374151", outline="#9ca3af", width=2
+            )
+            canvas.create_text(x, y, text=sh['name'], fill="#e5e7eb",
+                               font=("Menlo", 10))
 
+        # Рисуем рёбра ПОСЛЕ блоков, чтобы они были поверх
         for edge in edges:
             s, d = edge['from'], edge['to']
             if s not in positions or d not in positions:
                 continue
             x1, y1 = positions[s]
             x2, y2 = positions[d]
-            dy1 = BOX_H // 2 if y2 > y1 else -BOX_H // 2
-            dy2 = -BOX_H // 2 if y2 > y1 else BOX_H // 2
-            canvas.create_line(x1, y1 + dy1, x2, y2 + dy2,
-                               arrow="last", fill="#f59e0b", width=2, arrowshape=(10, 12, 4))
 
-        canvas.create_rectangle(16, H - 70, 185, H - 10, fill="#1e293b", outline="#334155")
-        canvas.create_rectangle(26, H - 58, 50, H - 42, fill="#1d4ed8", outline="#60a5fa")
-        canvas.create_text(57, H - 50, anchor="w", text="Сервис", fill="white", font=("Menlo", 9))
-        canvas.create_rectangle(26, H - 36, 50, H - 20, fill="#374151", outline="#9ca3af")
-        canvas.create_text(57, H - 28, anchor="w", text="Shared-библиотека", fill="white", font=("Menlo", 9))
+            if abs(y1 - y2) < 10:
+                # Горизонтальное ребро (сервис → сервис на одной строке):
+                # рисуем дугу ВЫШЕ строки сервисов, выходя из боковых сторон
+                side1 = BOX_W // 2 if x2 > x1 else -(BOX_W // 2)
+                side2 = -(BOX_W // 2) if x2 > x1 else BOX_W // 2
+                sx, sy = x1 + side1, y1
+                ex, ey = x2 + side2, y2
+                mid_x = (sx + ex) / 2
+                arc_y  = y1 - 55    # дуга на 55px выше
+                canvas.create_line(
+                    sx, sy, mid_x, arc_y, ex, ey,
+                    arrow="last", fill="#f59e0b", width=2,
+                    arrowshape=(10, 12, 4), smooth=True
+                )
+            else:
+                # Вертикальное ребро (сервис → shared): выходим снизу/сверху блока
+                dy1 = BOX_H // 2 if y2 > y1 else -(BOX_H // 2)
+                dy2 = -(BOX_H // 2) if y2 > y1 else BOX_H // 2
+                canvas.create_line(
+                    x1, y1 + dy1, x2, y2 + dy2,
+                    arrow="last", fill="#f59e0b", width=2,
+                    arrowshape=(10, 12, 4)
+                )
+
+        # Легенда
+        canvas.create_rectangle(16, H - 78, 195, H - 10, fill="#1e293b", outline="#334155")
+        canvas.create_rectangle(26, H - 66, 50, H - 50, fill="#1d4ed8", outline="#60a5fa")
+        canvas.create_text(57, H - 58, anchor="w", text="Сервис", fill="white", font=("Menlo", 9))
+        canvas.create_rectangle(26, H - 44, 50, H - 28, fill="#374151", outline="#9ca3af")
+        canvas.create_text(57, H - 36, anchor="w", text="Shared-библиотека", fill="white", font=("Menlo", 9))
+        canvas.create_line(26, H - 16, 50, H - 16, fill="#f59e0b", width=2,
+                           arrow="last", arrowshape=(8, 10, 3))
+        canvas.create_text(57, H - 16, anchor="w", text="Импорт", fill="white", font=("Menlo", 9))
 
         canvas.create_text(W // 2, 40, text="Карта зависимостей микросервисов",
                            fill="#e2e8f0", font=("Menlo", 14, "bold"))
@@ -373,11 +432,9 @@ class AMMApp(ctk.CTk):
         threading.Thread(target=self._run_delete, daemon=True).start()
 
     def _run_delete(self):
-        # 1. Останавливаем контейнеры и удаляем volume с данными БД
         if os.path.exists(self.final_output_path):
             self.run_subprocess(["docker", "compose", "down", "-v"])
 
-        # 2. Удаляем папку docker_out
         try:
             if os.path.exists(self.final_output_path):
                 shutil.rmtree(self.final_output_path)
@@ -386,7 +443,6 @@ class AMMApp(ctk.CTk):
             print(f"❌ Не удалось удалить docker_out: {e}\n")
             return
 
-        # 3. Обновляем UI
         self.after(0, self._after_delete)
 
     def _after_delete(self):

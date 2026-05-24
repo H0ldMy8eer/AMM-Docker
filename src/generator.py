@@ -7,6 +7,59 @@ import string
 from jinja2 import Environment, FileSystemLoader
 import scanner
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Framework-aware base dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Minimum infrastructure deps added to every generated service.
+# The set is chosen based on the detected framework so we never hardcode Flask
+# into a FastAPI or Django project.
+FRAMEWORK_BASE_DEPS = {
+    'flask': {
+        'Flask==3.0.0',
+        'Flask-SQLAlchemy==3.1.1',
+        'psycopg2-binary==2.9.9',
+        'requests==2.31.0',
+    },
+    'fastapi': {
+        'fastapi>=0.100.0',
+        'uvicorn[standard]>=0.23.0',
+        'sqlalchemy>=2.0',
+        'psycopg2-binary==2.9.9',
+        'requests==2.31.0',
+        'python-multipart>=0.0.6',
+    },
+    'django': {
+        'Django>=4.2',
+        'psycopg2-binary==2.9.9',
+        'requests==2.31.0',
+        'gunicorn>=21.0',
+    },
+    'starlette': {
+        'starlette>=0.27.0',
+        'uvicorn[standard]>=0.23.0',
+        'psycopg2-binary==2.9.9',
+        'requests==2.31.0',
+    },
+    'sanic': {
+        'sanic>=23.0',
+        'psycopg2-binary==2.9.9',
+        'requests==2.31.0',
+    },
+    # unknown / unrecognised → fall back to Flask (templates are Flask-based)
+    'unknown': {
+        'Flask==3.0.0',
+        'Flask-SQLAlchemy==3.1.1',
+        'psycopg2-binary==2.9.9',
+        'requests==2.31.0',
+    },
+}
+
+# Root-level files that should NOT be copied into service dirs
+# (they belong to the monolith's entry-point, not individual services)
+_SKIP_ROOT_FILES = frozenset({'run.py', 'app.py', 'wsgi.py', 'asgi.py', 'manage.py'})
+
+
 def generate_password(length=24):
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
@@ -19,10 +72,10 @@ def sanitize_models(service_dir):
                 file_path = os.path.join(root, file)
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-                
+
                 new_content = re.sub(r",\s*db\.ForeignKey\([^)]+\)", "", content)
                 new_content = re.sub(r"^\s*\w+\s*=\s*db\.relationship\(.+\).*$", "", new_content, flags=re.MULTILINE)
-                
+
                 if content != new_content:
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(new_content)
@@ -32,14 +85,14 @@ def create_stubs(service_build_dir, all_modules, current_service_name):
         mod_name = module['name']
         if mod_name == current_service_name or module.get('type') == 'shared':
             continue
-            
+
         stub_dir = os.path.join(service_build_dir, mod_name)
         if not os.path.exists(stub_dir):
             os.makedirs(stub_dir)
-            
+
             with open(os.path.join(stub_dir, "__init__.py"), "w") as f:
                 f.write(f"# Stub for {mod_name}\n")
-            
+
             with open(os.path.join(stub_dir, "models.py"), "w") as f:
                 f.write("""
 import sys
@@ -59,8 +112,9 @@ class Stub:
 
 sys.modules[__name__] = Stub()
 """)
-                
-def render_service(module_info, all_modules, all_deps_map, output_path, template_env, source_path):
+
+def render_service(module_info, all_modules, all_deps_map, output_path,
+                   template_env, source_path, framework='flask'):
     service_name = module_info['name']
     service_rel_path = module_info['path']
     is_per_file = 'module_file' in module_info
@@ -79,7 +133,6 @@ def render_service(module_info, all_modules, all_deps_map, output_path, template
         if os.path.exists(abs_source_path):
             shutil.copytree(abs_source_path, service_code_dest)
     else:
-        # Стандартный случай: копируем папку сервиса
         service_code_dest = os.path.join(service_build_dir, service_name)
         if os.path.exists(service_code_dest):
             shutil.rmtree(service_code_dest)
@@ -102,16 +155,15 @@ def render_service(module_info, all_modules, all_deps_map, output_path, template
     with open(os.path.join(service_build_dir, "http_client.py"), "w") as f:
         f.write(client_content)
 
+    # Собираем зависимости: из requirements проекта + базовые для фреймворка
     final_deps = set()
     if '.' in all_deps_map:
         final_deps.update(all_deps_map['.'])
     if service_rel_path in all_deps_map:
         final_deps.update(all_deps_map[service_rel_path])
 
-    final_deps.add("requests==2.31.0")
-    final_deps.add("Flask==3.0.0")
-    final_deps.add("Flask-SQLAlchemy==3.1.1")
-    final_deps.add("psycopg2-binary==2.9.9")
+    base_deps = FRAMEWORK_BASE_DEPS.get(framework, FRAMEWORK_BASE_DEPS['unknown'])
+    final_deps.update(base_deps)
 
     with open(os.path.join(service_build_dir, "requirements.txt"), "w") as f:
         f.write("\n".join(sorted(final_deps)))
@@ -141,29 +193,34 @@ def run_generation(source_path=None, output_path=None):
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
     templates_dir = os.path.join(project_root, "templates")
-    
-    if os.path.exists(output_path): 
+
+    if os.path.exists(output_path):
         shutil.rmtree(output_path)
     os.makedirs(output_path, exist_ok=True)
 
     # 1. СКАНИРОВАНИЕ
     scan_result = scanner.scan_project_structure(source_path)
     all_deps_map = scan_result.get('dependencies', {})
-    
+
     all_modules = scan_result.get('modules', [])
     runnable_services = [m for m in all_modules if m.get('type') == 'service']
     shared_libs = [m for m in all_modules if m.get('type') == 'shared']
-    
+
     env = Environment(loader=FileSystemLoader(templates_dir))
-    
-    # 2. ГЕНЕРАЦИЯ СЕРВИСОВ
+
+    # 2. ОПРЕДЕЛЕНИЕ ФРЕЙМВОРКА
+    framework = scanner.detect_framework(source_path, all_deps_map.get('.', []))
+    print(f"🔧 [FRAMEWORK] Обнаружен: {framework}")
+
+    # 3. ГЕНЕРАЦИЯ СЕРВИСОВ
     for module in runnable_services:
         try:
-            render_service(module, all_modules, all_deps_map, output_path, env, source_path)
+            render_service(module, all_modules, all_deps_map, output_path,
+                           env, source_path, framework)
         except Exception as e:
             print(f"❌ Ошибка генерации сервиса {module['name']}: {e}")
 
-    # 3. КОПИРОВАНИЕ ОБЩИХ РЕСУРСОВ
+    # 4. КОПИРОВАНИЕ ОБЩИХ РЕСУРСОВ
     for service in runnable_services:
         service_dir = os.path.join(output_path, service['name'])
 
@@ -172,7 +229,6 @@ def run_generation(source_path=None, output_path=None):
         if os.path.exists(db_src):
             shutil.copy(db_src, db_dest)
         elif not os.path.exists(db_dest):
-            # Генерируем минимальный db.py если в монолите его нет
             with open(db_dest, 'w') as f:
                 f.write("from flask_sqlalchemy import SQLAlchemy\ndb = SQLAlchemy()\n")
 
@@ -181,7 +237,7 @@ def run_generation(source_path=None, output_path=None):
             if os.path.exists(shared_src):
                 shutil.copytree(shared_src, os.path.join(service_dir, shared['name']), dirs_exist_ok=True)
 
-        # Копируем глобальные templates/ и static/ из корня монолита если они есть
+        # Копируем глобальные templates/ и static/ из корня монолита
         for root_resource in ('templates', 'static'):
             resource_src = os.path.join(source_path, root_resource)
             if os.path.exists(resource_src):
@@ -189,24 +245,22 @@ def run_generation(source_path=None, output_path=None):
                 shutil.copytree(resource_src, resource_dst, dirs_exist_ok=True)
 
         # Копируем корневые .py файлы (models.py, config.py, extensions.py и т.д.)
-        # чтобы сервисные импорты типа "from models import db" работали
-        _skip_root_files = {'run.py', 'app.py'}
         for fname in os.listdir(source_path):
             if not fname.endswith('.py'):
                 continue
-            if fname in _skip_root_files:
+            if fname in _SKIP_ROOT_FILES:
                 continue
             src_file = os.path.join(source_path, fname)
             if not os.path.isfile(src_file):
                 continue
             dst_file = os.path.join(service_dir, fname)
-            if not os.path.exists(dst_file):  # не перезаписываем сгенерированный db.py
+            if not os.path.exists(dst_file):
                 shutil.copy(src_file, dst_file)
 
-    # 4. АНАЛИЗ ГРАФА ЗАВИСИМОСТЕЙ
+    # 5. АНАЛИЗ ГРАФА ЗАВИСИМОСТЕЙ
     scan_result['import_edges'] = scanner.analyze_import_graph(source_path, all_modules)
 
-    # 5. ГЕНЕРАЦИЯ API GATEWAY (NGINX)
+    # 6. ГЕНЕРАЦИЯ API GATEWAY (NGINX)
     print(" Генерация API Gateway (Nginx)...")
     nginx_dir = os.path.join(output_path, "nginx")
     os.makedirs(nginx_dir, exist_ok=True)
@@ -214,7 +268,7 @@ def run_generation(source_path=None, output_path=None):
     with open(os.path.join(nginx_dir, "nginx.conf"), "w") as f:
         f.write(nginx_content)
 
-    # 6. ГЕНЕРАЦИЯ .env С СЛУЧАЙНЫМ ПАРОЛЕМ
+    # 7. ГЕНЕРАЦИЯ .env С СЛУЧАЙНЫМ ПАРОЛЕМ
     pg_password = generate_password()
     secret_key = generate_password(32)
     env_content = (
@@ -238,7 +292,7 @@ def run_generation(source_path=None, output_path=None):
 
     print(f"🔐 Сгенерирован случайный пароль БД → {env_path}")
 
-    # 7. КОНФИГИ ЛОГИРОВАНИЯ (Promtail + Grafana)
+    # 8. КОНФИГИ ЛОГИРОВАНИЯ (Promtail + Grafana)
     logging_dir = os.path.join(output_path, "logging")
     os.makedirs(logging_dir, exist_ok=True)
     for config_file in ("promtail-config.yaml", "grafana-datasource.yaml"):
@@ -247,12 +301,10 @@ def run_generation(source_path=None, output_path=None):
             shutil.copy(src_config, os.path.join(logging_dir, config_file))
     print("📊 Конфиги Loki/Promtail/Grafana сгенерированы → logging/")
 
-    # 8. DOCKER COMPOSE
+    # 9. DOCKER COMPOSE
     compose_content = env.get_template("docker-compose.jinja2").render(services=runnable_services)
     with open(os.path.join(output_path, "docker-compose.yaml"), "w") as f:
         f.write(compose_content)
 
     print("\n✅ Генерация завершена успешно!")
     return scan_result
-
-

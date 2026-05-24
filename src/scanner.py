@@ -1,10 +1,64 @@
+"""
+scanner.py — AST-based project scanner for AMM-Docker.
+
+Framework-agnostic: detects Flask Blueprints, FastAPI APIRouter,
+Starlette Router, Flask-RESTX Namespace, and Django urlpatterns.
+All source analysis is done via Python's built-in `ast` module —
+immune to false positives from comments and string literals.
+"""
 import os
 import ast
+from collections import defaultdict
 
-SERVICE_FILES = {"routes.py", "views.py", "api.py", "handlers.py", "endpoints.py", "resources.py"}
-IGNORE_DIRS = {'__pycache__', 'venv', 'env', 'node_modules', 'instance', 'migrations',
-               'tests', 'test', '.git', 'dist', 'build', 'docker_out'}
+# ─────────────────────────────────────────────────────────────────────────────
+# Framework-agnostic constants
+# ─────────────────────────────────────────────────────────────────────────────
 
+# Router/Blueprint class names across popular Python web frameworks
+ROUTER_CLASSES = frozenset({
+    'Blueprint',   # Flask, Quart, Sanic
+    'APIRouter',   # FastAPI
+    'Router',      # Starlette
+    'Namespace',   # Flask-RESTX / Flask-RESTPlus
+})
+
+# Which keyword argument carries the URL prefix for each router class
+ROUTER_PREFIX_KWARG = {
+    'Blueprint':  'url_prefix',
+    'APIRouter':  'prefix',
+    'Router':     'prefix',
+    'Namespace':  'path',
+}
+
+# Variable-name suffixes to strip when deriving a service name from a var name
+_VAR_SUFFIXES = (
+    '_blueprint', '_bp', 'blueprint', 'bp',
+    '_router',    '_route',   'router',   'route',
+    '_api',       '_ns',      'ns',       '_resource',
+)
+
+# File names that strongly hint at a service entry-point (any framework)
+SERVICE_FILES = frozenset({
+    # Flask / generic REST
+    'routes.py', 'views.py', 'api.py',
+    'handlers.py', 'endpoints.py', 'resources.py',
+    # FastAPI / Starlette
+    'router.py', 'routers.py',
+    # Django
+    'urls.py',
+})
+
+IGNORE_DIRS = frozenset({
+    '__pycache__', 'venv', 'env', '.venv',
+    'node_modules', 'instance', 'migrations',
+    'tests', 'test', '.git', 'dist', 'build', 'docker_out',
+    '.tox', '.mypy_cache', '.pytest_cache',
+})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public helper: requirements.txt parser
+# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_requirements(file_path):
     dependencies = []
@@ -28,24 +82,16 @@ def parse_requirements(file_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_ast(fpath):
-    """Parse a Python source file into an AST. Returns None on any failure."""
+    """
+    Parse a Python source file into an AST.
+    Returns None on SyntaxError, encoding error, or any IO failure.
+    """
     try:
         with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
             source = f.read()
         return ast.parse(source, filename=fpath)
     except Exception:
         return None
-
-
-def _is_blueprint_call(node):
-    """True if node is a Call to Blueprint (bare name or attribute access)."""
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    return (
-        (isinstance(func, ast.Name) and func.id == 'Blueprint') or
-        (isinstance(func, ast.Attribute) and func.attr == 'Blueprint')
-    )
 
 
 def _extract_str(node):
@@ -55,17 +101,58 @@ def _extract_str(node):
     return None
 
 
-def _extract_blueprints_ast(fpath):
+def _is_router_call(node):
     """
-    Return {var_name: {'url_prefix': str|None}} for every Blueprint assignment
-    found in the file.
+    True if node is a Call to any known router/blueprint class
+    (bare name or attribute access, e.g. flask.Blueprint or APIRouter).
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        (isinstance(func, ast.Name) and func.id in ROUTER_CLASSES) or
+        (isinstance(func, ast.Attribute) and func.attr in ROUTER_CLASSES)
+    )
+
+
+def _get_router_class(call_node):
+    """Return the router class name from a Call node."""
+    func = call_node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _has_urlpatterns(fpath):
+    """
+    Return True if the file contains a top-level `urlpatterns = [...]`
+    assignment (Django app indicator).
+    """
+    tree = _parse_ast(fpath)
+    if tree is None:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == 'urlpatterns':
+                    return True
+    return False
+
+
+def _extract_routers_ast(fpath):
+    """
+    Return {var_name: {'url_prefix': str|None}} for every router/blueprint
+    assignment in the file.
 
     Handles:
-      - bp = Blueprint(...)
-      - bp: Blueprint = Blueprint(...)
-      - bp = flask.Blueprint(...)
+      - bp = Blueprint(...)                          (Flask)
+      - router = APIRouter(prefix='/users')          (FastAPI)
+      - bp: Blueprint = Blueprint(...)               (annotated assignment)
+      - bp = flask.Blueprint(...)                    (attribute access)
 
-    Not fooled by commented-out code, string literals, or multi-line calls.
+    Not fooled by comments, multi-line calls, or string literals.
     """
     tree = _parse_ast(fpath)
     if tree is None:
@@ -77,19 +164,19 @@ def _extract_blueprints_ast(fpath):
         call = None
         var_name = None
 
-        # bp = Blueprint(...)
-        if isinstance(node, ast.Assign) and _is_blueprint_call(node.value):
+        # var = Router(...)
+        if isinstance(node, ast.Assign) and _is_router_call(node.value):
             call = node.value
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     var_name = target.id
                     break
 
-        # bp: Blueprint = Blueprint(...)
+        # var: Router = Router(...)
         elif (
             isinstance(node, ast.AnnAssign)
             and node.value is not None
-            and _is_blueprint_call(node.value)
+            and _is_router_call(node.value)
             and isinstance(node.target, ast.Name)
         ):
             call = node.value
@@ -98,9 +185,13 @@ def _extract_blueprints_ast(fpath):
         if call is None or var_name is None:
             continue
 
+        # Determine which kwarg carries the prefix for this router class
+        router_class = _get_router_class(call)
+        primary_kwarg = ROUTER_PREFIX_KWARG.get(router_class, 'url_prefix')
+
         url_prefix = None
         for kw in call.keywords:
-            if kw.arg == 'url_prefix':
+            if kw.arg in (primary_kwarg, 'url_prefix', 'prefix'):
                 url_prefix = _extract_str(kw.value)
                 break
 
@@ -114,12 +205,13 @@ def _collect_imports_ast(fpath):
     Return the set of top-level module names imported in a file.
 
     Handles:
-      - import X           → 'X'
-      - import X.Y.Z       → 'X'
-      - from X import Y    → 'X'
-      - from X.Y import Z  → 'X'
+      - import X / import X.Y.Z                 → 'X'
+      - from X import Y / from X.Y import Z     → 'X'
+      - importlib.import_module('X.Y')           → 'X'
+      - __import__('X')                          → 'X'
 
-    Ignores relative imports (level > 0) to avoid false edges within a package.
+    Relative imports (level > 0) are ignored to prevent intra-package
+    false edges in the dependency graph.
     """
     tree = _parse_ast(fpath)
     if tree is None:
@@ -130,9 +222,25 @@ def _collect_imports_ast(fpath):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imported.add(alias.name.split('.')[0])
+
         elif isinstance(node, ast.ImportFrom):
             if node.module and node.level == 0:
                 imported.add(node.module.split('.')[0])
+
+        elif isinstance(node, ast.Call):
+            func = node.func
+            func_name = None
+            if isinstance(func, ast.Name):
+                func_name = func.id
+            elif isinstance(func, ast.Attribute):
+                func_name = func.attr
+
+            # importlib.import_module('pkg') and __import__('pkg')
+            if func_name in ('import_module', '__import__') and node.args:
+                mod_name = _extract_str(node.args[0])
+                if mod_name:
+                    imported.add(mod_name.split('.')[0])
+
     return imported
 
 
@@ -142,23 +250,38 @@ def _collect_imports_ast(fpath):
 
 def _is_service_dir(dirpath, filenames):
     """
-    A directory is a 'service' if it contains a known service filename
-    (routes.py, views.py, …) OR if any .py file defines a Blueprint.
+    A directory is a 'service' if it contains:
+      - a known service-entry filename (any framework), OR
+      - any .py file that defines a router/blueprint (any framework), OR
+      - a urls.py or any .py file with urlpatterns (Django)
     """
     if not any(f.endswith('.py') for f in filenames):
         return False
     if any(f in SERVICE_FILES for f in filenames):
         return True
     for fname in filenames:
-        if fname.endswith('.py') and _extract_blueprints_ast(os.path.join(dirpath, fname)):
+        if not fname.endswith('.py'):
+            continue
+        fpath = os.path.join(dirpath, fname)
+        if _extract_routers_ast(fpath):
+            return True
+        if _has_urlpatterns(fpath):
             return True
     return False
 
 
 def _service_name_from_var(var_name):
-    """auth_bp / auth_blueprint / AuthBlueprint → 'auth'"""
+    """
+    Derive a clean service name from a router/blueprint variable name.
+
+    Examples:
+      auth_bp          → auth
+      auth_blueprint   → auth
+      users_router     → users
+      AuthAPIRouter    → authapiou  (falls back to lowercased name)
+    """
     name = var_name.lower()
-    for suffix in ('_blueprint', '_bp', 'blueprint', 'bp'):
+    for suffix in _VAR_SUFFIXES:
         if name.endswith(suffix) and len(name) > len(suffix):
             name = name[:-len(suffix)]
             break
@@ -178,11 +301,11 @@ def _count_py_files(dirpath):
 
 def scan_project_structure(root_path):
     """
-    Scan a monolith project using AST analysis.
+    Scan a monolith project using AST analysis (framework-agnostic).
 
-    Auto-decomposition rule: if a directory has ≥2 Blueprint definitions
-    across its direct .py files, each Blueprint becomes its own microservice.
-    Otherwise the whole directory is treated as one service or shared library.
+    Auto-decomposition: if a directory has ≥2 router definitions across
+    its direct .py files, each router becomes its own microservice.
+    Otherwise the whole directory is one service or shared library.
     """
     project_map = {
         "root": root_path,
@@ -204,7 +327,7 @@ def scan_project_structure(root_path):
 
         rel_path = os.path.relpath(dirpath, root_path)
 
-        # Root dir: only collect root requirements.txt
+        # Root: only collect root-level requirements.txt
         if rel_path == '.':
             if "requirements.txt" in filenames:
                 project_map["dependencies"]['.'] = parse_requirements(
@@ -225,22 +348,22 @@ def scan_project_structure(root_path):
         if total_py_count == 0:
             continue
 
-        # Collect Blueprint definitions from all direct .py files via AST
-        all_bp_defs = {}
+        # Collect router definitions from all direct .py files via AST
+        all_router_defs = {}
         container_name = rel_path.split(os.sep)[-1]
         for fname in filenames:
             if not fname.endswith('.py'):
                 continue
-            bps = _extract_blueprints_ast(os.path.join(dirpath, fname))
-            for var_name, info in bps.items():
-                all_bp_defs[(fname, var_name)] = info
+            routers = _extract_routers_ast(os.path.join(dirpath, fname))
+            for var_name, info in routers.items():
+                all_router_defs[(fname, var_name)] = info
 
-        if len(all_bp_defs) >= 2:
-            # Multiple Blueprints → auto-decompose each into its own service
+        if len(all_router_defs) >= 2:
+            # Multiple routers → auto-decompose each into its own service
             per_file_container_dirs.add(rel_path)
-            print(f"   🔀 [DECOMPOSE] {rel_path}/ → {len(all_bp_defs)} сервисов")
+            print(f"   🔀 [DECOMPOSE] {rel_path}/ → {len(all_router_defs)} сервисов")
 
-            for (fname, var_name), info in all_bp_defs.items():
+            for (fname, var_name), info in all_router_defs.items():
                 url_prefix = info['url_prefix']
                 if url_prefix:
                     service_name = url_prefix.strip('/').split('/')[0]
@@ -248,8 +371,10 @@ def scan_project_structure(root_path):
                     service_name = _service_name_from_var(var_name)
 
                 module_name = fname[:-3]
-                import_path = container_name if module_name == '__init__' \
+                import_path = (
+                    container_name if module_name == '__init__'
                     else f"{container_name}.{module_name}"
+                )
 
                 candidates.append({
                     'name_override': service_name,
@@ -277,7 +402,7 @@ def scan_project_structure(root_path):
 
     # ── Second pass: deduplicate and build module list ──────────────────────
 
-    # Parent directories of nested services are just containers — don't add them
+    # Mark parent directories of nested services as containers (skip them)
     claimed_prefixes = set()
     for c in candidates:
         if c['is_service'] and c['depth'] > 0 and 'module_file' not in c:
@@ -289,7 +414,7 @@ def scan_project_structure(root_path):
         rel_path = c['rel_path']
         is_service = c['is_service']
 
-        # Skip the container directory when per-file decomposition applies
+        # Skip the container dir when per-file decomposition applies
         if rel_path in per_file_container_dirs and 'module_file' not in c:
             continue
 
@@ -332,14 +457,87 @@ def scan_project_structure(root_path):
     return project_map
 
 
+def detect_framework(root_path, root_deps=None):
+    """
+    Detect the primary web framework used in a monolith project.
+
+    Strategy (first match wins):
+      1. Presence of manage.py in root  → Django
+      2. Root requirements.txt package names
+      3. Import statements in root-level .py files
+
+    Returns one of: 'flask', 'fastapi', 'django', 'starlette', 'sanic',
+    'tornado', 'aiohttp', or 'unknown'.
+    """
+    # Package-name → framework mapping (lowercase, strip version/extras)
+    _PKG_MAP = {
+        'flask': 'flask', 'quart': 'flask', 'flask-restx': 'flask',
+        'flask-restful': 'flask', 'flask-smorest': 'flask',
+        'fastapi': 'fastapi',
+        'django': 'django',
+        'starlette': 'starlette',
+        'sanic': 'sanic',
+        'tornado': 'tornado',
+        'aiohttp': 'aiohttp',
+        'uvicorn': 'fastapi',   # strong fastapi hint
+    }
+
+    # 1. manage.py presence → Django
+    if os.path.exists(os.path.join(root_path, 'manage.py')):
+        return 'django'
+
+    # 2. Requirements.txt
+    deps = root_deps or parse_requirements(
+        os.path.join(root_path, 'requirements.txt')
+    )
+    for raw in deps:
+        pkg = raw.split('==')[0].split('>=')[0].split('<=')[0] \
+                 .split('[')[0].strip().lower()
+        if pkg in _PKG_MAP:
+            return _PKG_MAP[pkg]
+
+    # 3. Import statements in root .py files
+    try:
+        root_files = [
+            f for f in os.listdir(root_path)
+            if f.endswith('.py') and os.path.isfile(os.path.join(root_path, f))
+        ]
+    except OSError:
+        return 'unknown'
+
+    for fname in root_files:
+        imported = _collect_imports_ast(os.path.join(root_path, fname))
+        for name in imported:
+            fw = _PKG_MAP.get(name.lower())
+            if fw:
+                return fw
+
+    return 'unknown'
+
+
 def analyze_import_graph(root_path, modules):
     """
-    Build an import graph between modules using AST.
+    Build a directed import graph between modules using AST.
 
-    Only absolute imports are considered; relative imports (level > 0) are
-    ignored to avoid intra-package false edges.
+    Resolves imports to modules by both module name AND directory name so that
+    auto-decomposed services (whose derived name ≠ directory name) are still
+    correctly connected.
+
+    Handles: import X, from X import Y, importlib.import_module('X'),
+    __import__('X'). Relative imports (level > 0) are ignored.
     """
-    module_names = {m['name'] for m in modules}
+    # Build: python_identifier → set of module names it may represent.
+    # A module is reachable by:
+    #   1. its logical name  (standard case: name == dir name)
+    #   2. every path component  (handles nested paths and auto-decomposition
+    #      where the derived service name ≠ the actual directory name)
+    pkg_to_modules = defaultdict(set)
+    for m in modules:
+        pkg_to_modules[m['name']].add(m['name'])
+        for part in m['path'].split(os.sep):
+            if part:
+                pkg_to_modules[part].add(m['name'])
+
     edges = []
     seen = set()
 
@@ -348,22 +546,35 @@ def analyze_import_graph(root_path, modules):
         if not os.path.isdir(module_path):
             continue
 
+        # All Python identifiers that refer to THIS module (skip self-edges)
+        this_identifiers = {module['name'], module['path'].split(os.sep)[0]}
+
         for dirpath, _, filenames in os.walk(module_path):
             for filename in filenames:
                 if not filename.endswith('.py'):
                     continue
+
                 imported = _collect_imports_ast(os.path.join(dirpath, filename))
 
-                for target_name in imported:
-                    if target_name == module['name']:
+                for import_name in imported:
+                    if import_name in this_identifiers:
                         continue
-                    if target_name not in module_names:
-                        continue
-                    edge = (module['name'], target_name)
-                    if edge in seen:
-                        continue
-                    edges.append({'from': module['name'], 'to': target_name})
-                    seen.add(edge)
+
+                    for target_name in pkg_to_modules.get(import_name, set()):
+                        if target_name == module['name']:
+                            continue
+                        edge = (module['name'], target_name)
+                        if edge in seen:
+                            continue
+                        edges.append({'from': module['name'], 'to': target_name})
+                        seen.add(edge)
+
+    if edges:
+        print(f"   📊 [IMPORT GRAPH] Найдено {len(edges)} связей:")
+        for e in edges:
+            print(f"      {e['from']} → {e['to']}")
+    else:
+        print("   📊 [IMPORT GRAPH] Межмодульных импортов не обнаружено")
 
     return edges
 
