@@ -27,23 +27,37 @@ requests==2.31.0
 psycopg2-binary==2.9.9
 """,
         # Модуль пользователей (будущий микросервис 1)
+        # Импортирует: common → ребро users→common
         "users/": {
             "__init__.py": "",
             "views.py": """
 from flask import Blueprint
+from common import db
+
 user_bp = Blueprint('users', __name__)
 
 @user_bp.route('/')
 def index():
     return "User List"
 """,
-            "models.py": "# Здесь модель User для базы данных",
+            "models.py": """
+from common import db
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+""",
         },
         # Модуль товаров (будущий микросервис 2)
+        # Импортирует: common + users → рёбра products→common, products→users
         "products/": {
             "__init__.py": "",
             "views.py": """
 from flask import Blueprint
+from common import db
+from users import models as user_models
+
 product_bp = Blueprint('products', __name__)
 
 @product_bp.route('/')
@@ -53,16 +67,31 @@ def list():
             "utils.py": "import math\n# Вспомогательные функции",
         },
         # Модуль заказов (будущий микросервис 3)
+        # Импортирует: common + users → рёбра orders→common, orders→users
         "orders/": {
             "__init__.py": "",
-            "views.py": "# Логика заказов",
+            "views.py": """
+from flask import Blueprint
+from common import db
+from users import models as user_models
+
+order_bp = Blueprint('orders', __name__)
+
+@order_bp.route('/')
+def list():
+    return "Order List"
+""",
             # У заказов есть СВОЯ уникальная библиотека, которой нет в общем файле
-            "requirements.txt": "reportlab==4.0.0", 
+            "requirements.txt": "reportlab==4.0.0",
         },
         # Общие библиотеки (Shared kernel)
         "common/": {
              "__init__.py": "",
-             "db.py": "# Общее подключение к БД",
+             "db.py": """
+from flask_sqlalchemy import SQLAlchemy
+
+db = SQLAlchemy()
+""",
         }
     }
 
