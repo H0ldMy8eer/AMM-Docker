@@ -55,6 +55,12 @@ IGNORE_DIRS = frozenset({
     '.tox', '.mypy_cache', '.pytest_cache',
 })
 
+# Root-level .py files that are entry points, not shared modules
+_ROOT_ENTRY_FILES = frozenset({
+    'run', 'app', 'wsgi', 'asgi', 'manage', 'setup',
+    'conftest', 'init_db', 'settings', 'celery',
+})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public helper: requirements.txt parser
@@ -454,6 +460,30 @@ def scan_project_structure(root_path):
         suffix = f" [{c.get('url_prefix', '')}]" if 'url_prefix' in c else ""
         print(f"   {icon} [MODULE] {module_type}: {name} @ {rel_path}{suffix} (py: {c['total_py_count']})")
 
+    # Root-level .py files → shared modules (models.py, config.py, db.py, etc.)
+    # They're imported by services but never added as subdirectory candidates.
+    try:
+        root_entries = sorted(os.listdir(root_path))
+    except OSError:
+        root_entries = []
+
+    for fname in root_entries:
+        if not fname.endswith('.py'):
+            continue
+        stem = fname[:-3]
+        if stem.startswith('_') or stem in _ROOT_ENTRY_FILES:
+            continue
+        if not os.path.isfile(os.path.join(root_path, fname)):
+            continue
+        project_map['modules'].append({
+            'name': stem,
+            'path': fname,
+            'type': 'shared',
+            'files_count': 1,
+            'is_root_file': True,
+        })
+        print(f"   📄 [MODULE] shared: {stem} @ {fname} (root)")
+
     return project_map
 
 
@@ -542,6 +572,10 @@ def analyze_import_graph(root_path, modules):
     seen = set()
 
     for module in modules:
+        # Root-level file modules are shared targets, not sources of imports
+        if module.get('is_root_file'):
+            continue
+
         module_path = os.path.join(root_path, module['path'])
         if not os.path.isdir(module_path):
             continue
@@ -549,25 +583,32 @@ def analyze_import_graph(root_path, modules):
         # All Python identifiers that refer to THIS module (skip self-edges)
         this_identifiers = {module['name'], module['path'].split(os.sep)[0]}
 
-        for dirpath, _, filenames in os.walk(module_path):
-            for filename in filenames:
-                if not filename.endswith('.py'):
+        # For auto-decomposed per-file services scan only their specific file,
+        # not the entire shared directory (avoids false cross-service edges)
+        if 'module_file' in module:
+            files_to_scan = [os.path.join(module_path, module['module_file'])]
+        else:
+            files_to_scan = []
+            for dirpath, _, filenames in os.walk(module_path):
+                for filename in filenames:
+                    if filename.endswith('.py'):
+                        files_to_scan.append(os.path.join(dirpath, filename))
+
+        for fpath in files_to_scan:
+            imported = _collect_imports_ast(fpath)
+
+            for import_name in imported:
+                if import_name in this_identifiers:
                     continue
 
-                imported = _collect_imports_ast(os.path.join(dirpath, filename))
-
-                for import_name in imported:
-                    if import_name in this_identifiers:
+                for target_name in pkg_to_modules.get(import_name, set()):
+                    if target_name == module['name']:
                         continue
-
-                    for target_name in pkg_to_modules.get(import_name, set()):
-                        if target_name == module['name']:
-                            continue
-                        edge = (module['name'], target_name)
-                        if edge in seen:
-                            continue
-                        edges.append({'from': module['name'], 'to': target_name})
-                        seen.add(edge)
+                    edge = (module['name'], target_name)
+                    if edge in seen:
+                        continue
+                    edges.append({'from': module['name'], 'to': target_name})
+                    seen.add(edge)
 
     if edges:
         print(f"   📊 [IMPORT GRAPH] Найдено {len(edges)} связей:")
