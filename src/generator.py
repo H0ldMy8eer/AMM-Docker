@@ -233,8 +233,10 @@ def run_generation(source_path=None, output_path=None):
                 f.write("from flask_sqlalchemy import SQLAlchemy\ndb = SQLAlchemy()\n")
 
         for shared in shared_libs:
+            if shared.get('is_root_file'):
+                continue  # root .py files are copied by the loop below
             shared_src = os.path.join(source_path, shared['path'])
-            if os.path.exists(shared_src):
+            if os.path.exists(shared_src) and os.path.isdir(shared_src):
                 shutil.copytree(shared_src, os.path.join(service_dir, shared['name']), dirs_exist_ok=True)
 
         # Копируем глобальные templates/ и static/ из корня монолита
