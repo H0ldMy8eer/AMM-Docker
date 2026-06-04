@@ -1,0 +1,24 @@
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+FROM maven:3.9-eclipse-temurin-{{ java_version | default('17') }} AS builder
+
+WORKDIR /build
+
+# Cache dependencies first (invalidated only when pom.xml changes)
+COPY pom.xml .
+RUN mvn dependency:go-offline -q
+
+COPY src ./src
+RUN mvn package -DskipTests -q
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM eclipse-temurin:{{ java_version | default('17') }}-jre-jammy
+
+ENV JAVA_OPTS=""
+
+WORKDIR /app
+
+COPY --from=builder /build/target/*.jar app.jar
+
+EXPOSE {{ server_port | default(8080) }}
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar app.jar"]

@@ -7,24 +7,34 @@ http {
         listen 80;
 
         {% for service in services %}
-        {% set loc = service.url_prefix if service.url_prefix else '/' + service.name %}
-        location = {{ loc }} {
-            return 301 $scheme://$http_host{{ loc }}/;
-        }
-        location {{ loc }}/ {
-            proxy_pass http://{{ service.name }}:5000;
+        {% if service.type == 'frontend' %}
+        # Frontend catch-all — must come last (Jinja order matters, nginx uses longest-prefix)
+        location / {
+            proxy_pass http://{{ service.name }}:{{ service.port | default(80) }};
             proxy_set_header Host $http_host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_redirect http://{{ service.name }}:5000/ $scheme://$http_host/;
+        }
+        {% else %}
+        {% set loc = service.url_prefix if service.url_prefix else '/' + service.name %}
+        location {{ loc }}/ {
+            proxy_pass http://{{ service.name }}:{{ service.port | default(5000) }};
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
             proxy_connect_timeout 60s;
             proxy_read_timeout 60s;
         }
+        {% endif %}
         {% endfor %}
 
-        {% if services %}
-        {% set first_loc = services[0].url_prefix if services[0].url_prefix else '/' + services[0].name %}
+        {% set non_frontend = [] %}
+        {% for s in services %}{% if s.type != 'frontend' %}{% set _ = non_frontend.append(s) %}{% endif %}{% endfor %}
+        {% set has_frontend = services | selectattr('type', 'equalto', 'frontend') | list | length > 0 %}
+        {% if non_frontend and not has_frontend %}
+        {% set first_loc = non_frontend[0].url_prefix if non_frontend[0].url_prefix else '/' + non_frontend[0].name %}
         location / {
             return 302 $scheme://$http_host{{ first_loc }}/;
         }

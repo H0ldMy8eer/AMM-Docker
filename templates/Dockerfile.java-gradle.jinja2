@@ -1,0 +1,27 @@
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+FROM gradle:8-jdk{{ java_version | default('17') }}-jammy AS builder
+
+WORKDIR /build
+
+# Cache Gradle wrapper + dependencies before copying source
+COPY build.gradle* settings.gradle* gradle.properties* ./
+{% if build_tool == 'gradle-kts' %}
+COPY build.gradle.kts .
+{% endif %}
+RUN gradle dependencies -q --no-daemon 2>/dev/null || true
+
+COPY src ./src
+RUN gradle bootJar -x test -q --no-daemon
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM eclipse-temurin:{{ java_version | default('17') }}-jre-jammy
+
+ENV JAVA_OPTS=""
+
+WORKDIR /app
+
+COPY --from=builder /build/build/libs/*.jar app.jar
+
+EXPOSE {{ server_port | default(8080) }}
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar app.jar"]

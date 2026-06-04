@@ -115,6 +115,8 @@ class AMMApp(ctk.CTk):
         self.source_path = ""
         self.final_output_path = ""
         self.scan_result = None
+        self._up_process = None
+        self._up_cancelled = False
         sys.stdout = self
 
     # ------------------------------------------------------------------ #
@@ -219,7 +221,17 @@ class AMMApp(ctk.CTk):
         try:
             print(f"--- Сканирование монолита ---\n{self.source_path}\n")
             result = scanner.scan_project_structure(self.source_path)
-            result['import_edges'] = scanner.analyze_import_graph(self.source_path, result['modules'])
+            if result.get('language') == 'python':
+                result['import_edges'] = scanner.analyze_import_graph(self.source_path, result['modules'])
+            elif result.get('language') == 'java':
+                import java_scanner as _js
+                result['import_edges'] = _js.analyze_java_import_graph(
+                    result.get('modules', []),
+                    result.get('root', self.source_path),
+                    result.get('base_package', ''),
+                )
+            else:
+                result['import_edges'] = []
             self.scan_result = result
             self.after(0, self._finish_scan)
         except Exception as e:
@@ -230,21 +242,36 @@ class AMMApp(ctk.CTk):
         self._hide_progress()
         self.scan_btn.configure(state="normal", text="🔍 СКАНИРОВАТЬ")
 
-        modules  = self.scan_result.get('modules', [])
-        services = [m for m in modules if m['type'] == 'service']
-        shared   = [m for m in modules if m['type'] == 'shared']
-        edges    = self.scan_result.get('import_edges', [])
+        modules   = self.scan_result.get('modules', [])
+        services  = [m for m in modules if m['type'] == 'service']
+        shared    = [m for m in modules if m['type'] == 'shared']
+        edges     = self.scan_result.get('import_edges', [])
+        frontend  = self.scan_result.get('frontend')
 
-        print(f"✅ Найдено: {len(services)} сервис(ов), {len(shared)} shared-библиотек, {len(edges)} связей\n")
+        total_services = len(services) + (1 if frontend else 0)
+        print(f"✅ Найдено: {total_services} сервис(ов), {len(shared)} shared-библиотек, {len(edges)} связей\n")
         for m in modules:
             icon = "🚀" if m['type'] == 'service' else "📚"
-            print(f"  {icon} {m['name']}  ({m['files_count']} .py файлов)")
+            if 'files_count' in m:
+                detail = f"{m['files_count']} .py файлов"
+            else:
+                ctrl   = len(m.get('controllers', []))
+                svc    = len(m.get('services', []))
+                entity = len(m.get('entities', []))
+                detail = f"ctrl={ctrl}  svc={svc}  entity={entity}"
+            print(f"  {icon} {m['name']}  ({detail})")
+        if frontend:
+            fw   = frontend.get('framework', 'unknown')
+            bt   = frontend.get('build_tool', '')
+            port = frontend.get('dev_port', 3000)
+            ts   = " / TypeScript" if frontend.get('typescript') else ""
+            print(f"  🌐 frontend  ({fw} / {bt}{ts}, dev port {port})")
 
         if os.path.exists(self.final_output_path):
-            print(f"\n📦 Найдена папка docker_out — контейнеры готовы к запуску.")
+            print(f"\nНайдена папка docker_out — контейнеры готовы к запуску.")
             self._show_after_scan_with_output()
         else:
-            print(f"\n⚙️ Папка docker_out не найдена — нажмите «Генерировать».")
+            print(f"\nПапка docker_out не найдена — нажмите «Генерировать».")
             self._show_after_scan_no_output()
 
     def _finish_scan_error(self):
@@ -395,21 +422,46 @@ class AMMApp(ctk.CTk):
         if not self.final_output_path or not os.path.exists(self.final_output_path):
             messagebox.showerror("Ошибка", "Папка docker_out не найдена. Выполните генерацию.")
             return
-        print("\n🐳 Запуск контейнеров (Up)...")
-        threading.Thread(
-            target=self.run_subprocess,
-            args=(["docker", "compose", "up", "-d", "--build"],),
-            kwargs={"on_success": self._open_browser},
-            daemon=True
-        ).start()
+        print("\nЗапуск контейнеров (Up)...")
+        self._up_cancelled = False
+
+        def _run_up():
+            mac_env = os.environ.copy()
+            mac_env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:" + mac_env.get("PATH", "")
+            process = subprocess.Popen(
+                ["docker", "compose", "up", "-d", "--build",
+                 "--remove-orphans", "--force-recreate"],
+                cwd=self.final_output_path,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=mac_env
+            )
+            self._up_process = process
+            for line in process.stdout:
+                print(line, end="")
+            process.wait()
+            self._up_process = None
+            if not self._up_cancelled:
+                if process.returncode == 0:
+                    print("✅ Операция Docker завершена.\n")
+                    self._open_browser()
+                else:
+                    print(f"❌ Команда завершилась с кодом {process.returncode}\n")
+
+        threading.Thread(target=_run_up, daemon=True).start()
 
     def docker_down(self):
         if not self.final_output_path or not os.path.exists(self.final_output_path):
             messagebox.showerror("Ошибка", "Папка docker_out не найдена.")
             return
+        proc = self._up_process
+        if proc and proc.poll() is None:
+            self._up_cancelled = True
+            proc.terminate()
         print("\n🛑 Остановка контейнеров (Down)...")
         threading.Thread(target=self.run_subprocess,
-                         args=(["docker", "compose", "down"],), daemon=True).start()
+                         args=(["docker", "compose", "down", "--remove-orphans"],),
+                         kwargs={"success_codes": (0, 1)},
+                         daemon=True).start()
 
     def delete_docker_out(self):
         if not self.final_output_path or not os.path.exists(self.final_output_path):
@@ -433,7 +485,8 @@ class AMMApp(ctk.CTk):
 
     def _run_delete(self):
         if os.path.exists(self.final_output_path):
-            self.run_subprocess(["docker", "compose", "down", "-v"])
+            self.run_subprocess(["docker", "compose", "down", "-v", "--remove-orphans"],
+                               success_codes=(0, 1))
 
         try:
             if os.path.exists(self.final_output_path):
@@ -464,7 +517,7 @@ class AMMApp(ctk.CTk):
                 time.sleep(1)
         print(f"⚠️ Шлюз не ответил за 30 секунд. Откройте вручную: {url}\n")
 
-    def run_subprocess(self, command, on_success=None):
+    def run_subprocess(self, command, on_success=None, success_codes=(0,)):
         try:
             mac_env = os.environ.copy()
             mac_env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:" + mac_env.get("PATH", "")
@@ -476,7 +529,7 @@ class AMMApp(ctk.CTk):
             for line in process.stdout:
                 print(line, end="")
             process.wait()
-            if process.returncode == 0:
+            if process.returncode in success_codes:
                 print("✅ Операция Docker завершена.\n")
                 if on_success:
                     on_success()

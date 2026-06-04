@@ -1,14 +1,22 @@
 """
-scanner.py — AST-based project scanner for AMM-Docker.
+scanner.py — unified project scanner for AMM-Docker.
 
-Framework-agnostic: detects Flask Blueprints, FastAPI APIRouter,
-Starlette Router, Flask-RESTX Namespace, and Django urlpatterns.
-All source analysis is done via Python's built-in `ast` module —
+scan_project_structure() is the single public entry point.
+It auto-detects the project type and delegates to the right scanner:
+  • Python monolith  → AST-based Blueprint/APIRouter/urlpatterns analysis
+  • Java monolith    → java_scanner.scan_java_project()
+  • Frontend present → frontend_scanner.scan_frontend_project()
+
+All Python source analysis uses the built-in `ast` module —
 immune to false positives from comments and string literals.
 """
 import os
 import ast
+import json
 from collections import defaultdict
+
+import java_scanner
+import frontend_scanner
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Framework-agnostic constants
@@ -60,6 +68,134 @@ _ROOT_ENTRY_FILES = frozenset({
     'run', 'app', 'wsgi', 'asgi', 'manage', 'setup',
     'conftest', 'init_db', 'settings', 'celery',
 })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project-type detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Ordered list: first match wins. More specific frameworks go first.
+_FRONTEND_FRAMEWORK_MAP = [
+    ('next',           'next'),
+    ('nuxt',           'nuxt'),
+    ('@angular/core',  'angular'),
+    ('svelte',         'svelte'),
+    ('vue',            'vue'),
+    ('react',          'react'),
+]
+
+# package.json locations to probe, relative to a candidate root dir.
+# Covers flat repos (root-level package.json) and common monorepo layouts.
+_FRONTEND_SEARCH_DIRS = ('', 'frontend', 'client', 'web', 'ui', 'app')
+
+# Directories to probe for Java build files (pom.xml / build.gradle).
+# Covers flat repos and fullstack monorepos where Java lives in a subdir.
+_BACKEND_SEARCH_DIRS = ('', 'backend', 'server', 'api', 'app', 'service', 'core')
+
+
+def _detect_frontend_framework(package_json_path):
+    """
+    Return the primary frontend framework name from a package.json file,
+    or 'unknown' if the file cannot be read or no known framework is found.
+    """
+    try:
+        with open(package_json_path, 'r', encoding='utf-8') as fh:
+            pkg = json.load(fh)
+    except Exception:
+        return 'unknown'
+
+    all_deps = {**pkg.get('dependencies', {}), **pkg.get('devDependencies', {})}
+    for pkg_name, framework in _FRONTEND_FRAMEWORK_MAP:
+        if pkg_name in all_deps:
+            return framework
+    return 'unknown'
+
+
+def detect_project_type(root_path):
+    """
+    Detect the technology stack of a project.
+
+    Probes the root directory and one level of well-known subdirectories
+    (frontend/, client/, web/, ui/, app/) so that both flat repos and common
+    monorepo layouts are handled.
+
+    Returns:
+        {
+            'backend':       'java' | 'python' | None,
+            'build_tool':    'maven' | 'gradle' | 'gradle-kts' | None,
+            'frontend':      'react' | 'vue' | 'angular' | 'svelte'
+                             | 'next' | 'nuxt' | 'unknown' | None,
+            'frontend_root': str | None,   # abs path to the dir with package.json
+        }
+    """
+    try:
+        entries = set(os.listdir(root_path))
+    except OSError:
+        return {'backend': None, 'build_tool': None, 'frontend': None, 'frontend_root': None}
+
+    # ── Backend ──────────────────────────────────────────────────────────────
+    # Search root and common backend subdirs (backend/, server/, api/, …)
+    # so that fullstack monorepos like project/backend/pom.xml are found.
+    has_java   = False
+    build_tool = None
+    java_root  = None
+
+    for subdir in _BACKEND_SEARCH_DIRS:
+        candidate = os.path.join(root_path, subdir) if subdir else root_path
+        if not os.path.isdir(candidate):
+            continue
+        try:
+            c_entries = set(os.listdir(candidate))
+        except OSError:
+            continue
+        if 'pom.xml' in c_entries:
+            has_java, build_tool, java_root = True, 'maven', candidate
+            break
+        elif 'build.gradle.kts' in c_entries:
+            has_java, build_tool, java_root = True, 'gradle-kts', candidate
+            break
+        elif 'build.gradle' in c_entries:
+            has_java, build_tool, java_root = True, 'gradle', candidate
+            break
+
+    has_python = (
+        'requirements.txt' in entries or
+        any(
+            f.endswith('.py') and os.path.isfile(os.path.join(root_path, f))
+            for f in entries
+        )
+    )
+
+    if has_java:
+        backend = 'java'
+    elif has_python:
+        backend = 'python'
+        build_tool = None
+    else:
+        backend = None
+        build_tool = None
+
+    # ── Frontend ─────────────────────────────────────────────────────────────
+    frontend = None
+    frontend_root = None
+
+    for subdir in _FRONTEND_SEARCH_DIRS:
+        candidate = os.path.join(root_path, subdir) if subdir else root_path
+        pkg_json = os.path.join(candidate, 'package.json')
+        if os.path.isfile(pkg_json):
+            detected = _detect_frontend_framework(pkg_json)
+            if detected != 'unknown' or frontend is None:
+                frontend = detected
+                frontend_root = candidate
+            break
+
+    return {
+        'backend':       backend,
+        'build_tool':    build_tool,
+        'java_root':     java_root,
+        'frontend':      frontend,
+        'frontend_root': frontend_root,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,9 +441,9 @@ def _count_py_files(dirpath):
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def scan_project_structure(root_path):
+def _scan_python_project(root_path):
     """
-    Scan a monolith project using AST analysis (framework-agnostic).
+    Scan a Python monolith using AST analysis (framework-agnostic).
 
     Auto-decomposition: if a directory has ≥2 router definitions across
     its direct .py files, each router becomes its own microservice.
@@ -485,6 +621,62 @@ def scan_project_structure(root_path):
         print(f"   📄 [MODULE] shared: {stem} @ {fname} (root)")
 
     return project_map
+
+
+def scan_project_structure(root_path):
+    """
+    Unified entry point: detect the project type, delegate to the right
+    scanner, and attach frontend data when present.
+
+    Always returns a dict that includes at minimum:
+        root, language, project_type, modules, frontend (None if absent).
+
+    Python projects additionally have: dependencies, files.
+    Java projects additionally have: build_tool, framework, java_version,
+        spring_boot_version, features, server_port, db_type, db_url,
+        base_package, architecture, raw_deps.
+    """
+    ptype   = detect_project_type(root_path)
+    backend = ptype['backend']
+
+    print(f"🔍 [SCANNER] Тип проекта: backend={backend}  "
+          f"frontend={ptype['frontend']}")
+
+    # ── Backend ───────────────────────────────────────────────────────────────
+    if backend == 'java':
+        # Use the subdir where pom.xml / build.gradle was found (may be backend/)
+        java_root = ptype.get('java_root') or root_path
+        if java_root != root_path:
+            print(f"🔍 [SCANNER] Java-проект в поддиректории: {os.path.relpath(java_root, root_path)}/")
+        result = java_scanner.scan_java_project(java_root)
+        result['language'] = 'java'
+        # Keep keys consistent so the rest of the pipeline never KeyErrors
+        result.setdefault('dependencies', {})
+        result.setdefault('files', [])
+    elif backend is None and ptype['frontend']:
+        # Frontend-only project — skip Python scanning entirely
+        result = {
+            'root':         root_path,
+            'language':     'frontend',
+            'modules':      [],
+            'dependencies': {},
+            'files':        [],
+            'import_edges': [],
+        }
+    else:
+        result = _scan_python_project(root_path)
+        result['language'] = 'python'
+
+    result['project_type'] = ptype
+
+    # ── Frontend ──────────────────────────────────────────────────────────────
+    frontend_root = ptype.get('frontend_root')
+    if ptype['frontend'] and frontend_root:
+        result['frontend'] = frontend_scanner.scan_frontend_project(frontend_root)
+    else:
+        result['frontend'] = None
+
+    return result
 
 
 def detect_framework(root_path, root_deps=None):

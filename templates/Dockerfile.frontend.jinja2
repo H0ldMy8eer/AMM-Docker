@@ -1,0 +1,76 @@
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+FROM node:{{ node_version | default('20') }}-alpine AS builder
+
+WORKDIR /app
+
+# Cache install layer separately from source
+COPY package.json package-lock.json* yarn.lock* pnpm-lock.yaml* ./
+RUN \
+  if [ -f yarn.lock ]; then yarn install --frozen-lockfile; \
+  elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile; \
+  else npm ci --prefer-offline; \
+  fi
+
+COPY . .
+
+{% if framework == 'next' %}
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+{% elif framework == 'nuxt' %}
+RUN npm run generate
+{% elif framework == 'angular' %}
+RUN npm run build -- --configuration production
+{% else %}
+RUN npm run build
+{% endif %}
+
+{% if framework == 'next' %}
+# ── Stage 2: Next.js standalone runtime (node, not nginx) ─────────────────────
+FROM node:{{ node_version | default('20') }}-alpine
+
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=80
+
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+
+EXPOSE 80
+CMD ["node", "server.js"]
+
+{% else %}
+# ── Stage 2: nginx static server ──────────────────────────────────────────────
+FROM nginx:1.27-alpine
+
+RUN rm -rf /usr/share/nginx/html/*
+
+{% if framework == 'angular' %}
+COPY --from=builder /app/dist/{{ service_name }}/browser /usr/share/nginx/html
+{% elif framework == 'nuxt' %}
+COPY --from=builder /app/.output/public /usr/share/nginx/html
+{% else %}
+COPY --from=builder /app/dist /usr/share/nginx/html
+{% endif %}
+
+# SPA routing: unknown paths fall back to index.html
+RUN printf 'server {\n\
+    listen 80;\n\
+    root /usr/share/nginx/html;\n\
+    index index.html;\n\
+    location / {\n\
+        try_files $uri $uri/ /index.html;\n\
+    }\n\
+{% for proxy in api_proxy %}\
+    location {{ proxy.from }} {\n\
+        proxy_pass {{ proxy.to }};\n\
+        proxy_set_header Host $host;\n\
+        proxy_set_header X-Real-IP $remote_addr;\n\
+    }\n\
+{% endfor %}\
+}\n' > /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+{% endif %}

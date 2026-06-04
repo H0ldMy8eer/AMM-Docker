@@ -1,0 +1,6 @@
+{
+  "files.associations": {
+    "Dockerfile.*.jinja2": "plaintext",
+    "docker-compose.jinja2": "plaintext"
+  }
+}
