@@ -667,5 +667,68 @@ def scan_java_project(root_path):
     }
 
 
+_JAVA_IMPORT_RE = re.compile(r'^\s*import\s+([\w.]+)\s*;', re.MULTILINE)
+
+
+def analyze_java_import_graph(modules, java_root, base_package):
+    """
+    Build a directed import graph between Java domain modules.
+
+    Walks all .java files under src/main/java/{base_package}/,
+    determines each file's domain from its package declaration,
+    then looks for import statements that reference other known domains.
+
+    Returns: [{'from': str, 'to': str}, ...]
+    """
+    module_names = {m['name'] for m in modules}
+    bp_parts     = base_package.split('.') if base_package else []
+    bp_depth     = len(bp_parts)
+
+    java_src = os.path.join(java_root, 'src', 'main', 'java')
+    if not os.path.isdir(java_src):
+        return []
+
+    edges = []
+    seen  = set()
+
+    for dirpath, _, filenames in os.walk(java_src):
+        for fname in filenames:
+            if not fname.endswith('.java'):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            try:
+                content = open(fpath, 'r', encoding='utf-8', errors='replace').read()
+            except Exception:
+                continue
+
+            # Determine which domain this file belongs to
+            m = _JAVA_PACKAGE_RE.search(content)
+            if not m:
+                continue
+            pkg_parts = m.group(1).split('.')
+            sub = pkg_parts[bp_depth:]
+            if not sub:
+                continue
+            src_domain = sub[0].lower()
+            if src_domain not in module_names:
+                continue
+
+            # Collect all imports that reference another domain
+            for imp in _JAVA_IMPORT_RE.findall(content):
+                if not imp.startswith(base_package + '.'):
+                    continue
+                imp_sub = imp[len(base_package) + 1:].split('.')
+                if not imp_sub:
+                    continue
+                tgt_domain = imp_sub[0].lower()
+                if tgt_domain in module_names and tgt_domain != src_domain:
+                    key = (src_domain, tgt_domain)
+                    if key not in seen:
+                        seen.add(key)
+                        edges.append({'from': src_domain, 'to': tgt_domain})
+
+    return edges
+
+
 if __name__ == '__main__':
     pass

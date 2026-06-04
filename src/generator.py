@@ -292,6 +292,10 @@ def run_generation(source_path=None, output_path=None):
         java_svc = generate_java_service(scan_result, output_path, env)
         generated_services.append(java_svc)
 
+    elif language == 'frontend':
+        # ── Frontend-only project — no backend to generate ───────────────────
+        print("🌐 [GENERATOR] Frontend-only проект — бэкенд не генерируется")
+
     else:
         # ── Python (Flask / FastAPI / Django) ─────────────────────────────────
         runnable_services = [m for m in all_modules if m.get('type') == 'service']

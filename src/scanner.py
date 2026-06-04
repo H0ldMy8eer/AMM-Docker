@@ -88,6 +88,10 @@ _FRONTEND_FRAMEWORK_MAP = [
 # Covers flat repos (root-level package.json) and common monorepo layouts.
 _FRONTEND_SEARCH_DIRS = ('', 'frontend', 'client', 'web', 'ui', 'app')
 
+# Directories to probe for Java build files (pom.xml / build.gradle).
+# Covers flat repos and fullstack monorepos where Java lives in a subdir.
+_BACKEND_SEARCH_DIRS = ('', 'backend', 'server', 'api', 'app', 'service', 'core')
+
 
 def _detect_frontend_framework(package_json_path):
     """
@@ -130,11 +134,30 @@ def detect_project_type(root_path):
         return {'backend': None, 'build_tool': None, 'frontend': None, 'frontend_root': None}
 
     # ── Backend ──────────────────────────────────────────────────────────────
-    has_java = (
-        'pom.xml' in entries or
-        'build.gradle' in entries or
-        'build.gradle.kts' in entries
-    )
+    # Search root and common backend subdirs (backend/, server/, api/, …)
+    # so that fullstack monorepos like project/backend/pom.xml are found.
+    has_java   = False
+    build_tool = None
+    java_root  = None
+
+    for subdir in _BACKEND_SEARCH_DIRS:
+        candidate = os.path.join(root_path, subdir) if subdir else root_path
+        if not os.path.isdir(candidate):
+            continue
+        try:
+            c_entries = set(os.listdir(candidate))
+        except OSError:
+            continue
+        if 'pom.xml' in c_entries:
+            has_java, build_tool, java_root = True, 'maven', candidate
+            break
+        elif 'build.gradle.kts' in c_entries:
+            has_java, build_tool, java_root = True, 'gradle-kts', candidate
+            break
+        elif 'build.gradle' in c_entries:
+            has_java, build_tool, java_root = True, 'gradle', candidate
+            break
+
     has_python = (
         'requirements.txt' in entries or
         any(
@@ -145,12 +168,6 @@ def detect_project_type(root_path):
 
     if has_java:
         backend = 'java'
-        if 'pom.xml' in entries:
-            build_tool = 'maven'
-        elif 'build.gradle.kts' in entries:
-            build_tool = 'gradle-kts'
-        else:
-            build_tool = 'gradle'
     elif has_python:
         backend = 'python'
         build_tool = None
@@ -175,6 +192,7 @@ def detect_project_type(root_path):
     return {
         'backend':       backend,
         'build_tool':    build_tool,
+        'java_root':     java_root,
         'frontend':      frontend,
         'frontend_root': frontend_root,
     }
@@ -626,11 +644,25 @@ def scan_project_structure(root_path):
 
     # ── Backend ───────────────────────────────────────────────────────────────
     if backend == 'java':
-        result = java_scanner.scan_java_project(root_path)
+        # Use the subdir where pom.xml / build.gradle was found (may be backend/)
+        java_root = ptype.get('java_root') or root_path
+        if java_root != root_path:
+            print(f"🔍 [SCANNER] Java-проект в поддиректории: {os.path.relpath(java_root, root_path)}/")
+        result = java_scanner.scan_java_project(java_root)
         result['language'] = 'java'
         # Keep keys consistent so the rest of the pipeline never KeyErrors
         result.setdefault('dependencies', {})
         result.setdefault('files', [])
+    elif backend is None and ptype['frontend']:
+        # Frontend-only project — skip Python scanning entirely
+        result = {
+            'root':         root_path,
+            'language':     'frontend',
+            'modules':      [],
+            'dependencies': {},
+            'files':        [],
+            'import_edges': [],
+        }
     else:
         result = _scan_python_project(root_path)
         result['language'] = 'python'

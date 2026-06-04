@@ -1,5 +1,5 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM gradle:8-jdk{{ java_version | default('17') }}-alpine AS builder
+FROM gradle:8-jdk{{ java_version | default('17') }}-jammy AS builder
 
 WORKDIR /build
 
@@ -14,7 +14,7 @@ COPY src ./src
 RUN gradle bootJar -x test -q --no-daemon
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM eclipse-temurin:{{ java_version | default('17') }}-jre-alpine
+FROM eclipse-temurin:{{ java_version | default('17') }}-jre-jammy
 
 ENV JAVA_OPTS=""
 

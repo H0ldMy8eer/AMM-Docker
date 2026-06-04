@@ -18,16 +18,12 @@ http {
         }
         {% else %}
         {% set loc = service.url_prefix if service.url_prefix else '/' + service.name %}
-        location = {{ loc }} {
-            return 301 $scheme://$http_host{{ loc }}/;
-        }
         location {{ loc }}/ {
-            proxy_pass http://{{ service.name }}:{{ service.port | default(5000) }}/;
+            proxy_pass http://{{ service.name }}:{{ service.port | default(5000) }};
             proxy_set_header Host $http_host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_redirect http://{{ service.name }}:{{ service.port | default(5000) }}/ $scheme://$http_host/;
             proxy_connect_timeout 60s;
             proxy_read_timeout 60s;
         }
