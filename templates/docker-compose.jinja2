@@ -38,6 +38,22 @@ services:
     build:
       context: ./{{ service.name }}
       dockerfile: Dockerfile
+    {% if service.type == 'java' %}
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER}
+      - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
+      - SPRING_JPA_HIBERNATE_DDL_AUTO=update
+      - SERVER_PORT={{ service.port }}
+    ports:
+      - "{{ service.port }}:{{ service.port }}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    {% elif service.type == 'frontend' %}
+    ports:
+      - "3000:80"
+    {% else %}
     environment:
       - PYTHONPATH=/app
       - FLASK_ENV=development
@@ -45,11 +61,12 @@ services:
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     ports:
       - "{{ 5000 + loop.index }}:5000"
-    networks:
-      - app-network
     depends_on:
       postgres:
         condition: service_healthy
+    {% endif %}
+    networks:
+      - app-network
 
 {% endfor %}
 
@@ -76,7 +93,7 @@ services:
   grafana:
     image: grafana/grafana:10.0.0
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin

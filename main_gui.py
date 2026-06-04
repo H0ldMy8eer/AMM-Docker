@@ -241,10 +241,10 @@ class AMMApp(ctk.CTk):
             print(f"  {icon} {m['name']}  ({m['files_count']} .py файлов)")
 
         if os.path.exists(self.final_output_path):
-            print(f"\n📦 Найдена папка docker_out — контейнеры готовы к запуску.")
+            print(f"\nНайдена папка docker_out — контейнеры готовы к запуску.")
             self._show_after_scan_with_output()
         else:
-            print(f"\n⚙️ Папка docker_out не найдена — нажмите «Генерировать».")
+            print(f"\nПапка docker_out не найдена — нажмите «Генерировать».")
             self._show_after_scan_no_output()
 
     def _finish_scan_error(self):
@@ -395,7 +395,7 @@ class AMMApp(ctk.CTk):
         if not self.final_output_path or not os.path.exists(self.final_output_path):
             messagebox.showerror("Ошибка", "Папка docker_out не найдена. Выполните генерацию.")
             return
-        print("\n🐳 Запуск контейнеров (Up)...")
+        print("\nЗапуск контейнеров (Up)...")
         threading.Thread(
             target=self.run_subprocess,
             args=(["docker", "compose", "up", "-d", "--build"],),

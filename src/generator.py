@@ -59,6 +59,12 @@ FRAMEWORK_BASE_DEPS = {
 # (they belong to the monolith's entry-point, not individual services)
 _SKIP_ROOT_FILES = frozenset({'run.py', 'app.py', 'wsgi.py', 'asgi.py', 'manage.py'})
 
+# Build-artifact / IDE dirs to skip when copying Java source
+_JAVA_SKIP = frozenset({'.git', 'target', 'build', 'out', '.idea', '.gradle', '__pycache__'})
+
+# Heavy / generated dirs to skip when copying frontend source
+_FRONTEND_SKIP = frozenset({'node_modules', '.git', 'dist', 'build', '.next', 'out', '.nuxt'})
+
 
 def generate_password(length=24):
     alphabet = string.ascii_letters + string.digits
@@ -112,6 +118,79 @@ class Stub:
 
 sys.modules[__name__] = Stub()
 """)
+
+def generate_java_service(scan_result, output_path, template_env):
+    """Copy Java source + render the appropriate Dockerfile (Maven or Gradle)."""
+    build_tool  = scan_result.get('build_tool') or 'maven'
+    java_version = str(scan_result.get('java_version') or '17')
+    server_port  = int(scan_result.get('server_port') or 8080)
+    source_root  = scan_result['root']
+
+    service_name = 'backend'
+    service_dir  = os.path.join(output_path, service_name)
+    os.makedirs(service_dir, exist_ok=True)
+
+    for item in os.listdir(source_root):
+        if item in _JAVA_SKIP:
+            continue
+        src = os.path.join(source_root, item)
+        dst = os.path.join(service_dir, item)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+
+    tpl = 'Dockerfile.java-gradle.jinja2' if build_tool in ('gradle', 'gradle-kts') \
+          else 'Dockerfile.java-maven.jinja2'
+    dockerfile = template_env.get_template(tpl).render(
+        java_version=java_version,
+        server_port=server_port,
+        build_tool=build_tool,
+    )
+    with open(os.path.join(service_dir, 'Dockerfile'), 'w') as f:
+        f.write(dockerfile)
+
+    print(f"☕ [JAVA] {service_name} → {tpl}  port={server_port}")
+    return {'name': service_name, 'port': server_port, 'type': 'java', 'url_prefix': '/api'}
+
+
+def generate_frontend_service(frontend_info, output_path, template_env):
+    """Copy frontend source + render Dockerfile.frontend.jinja2."""
+    framework    = frontend_info.get('framework', 'react')
+    build_tool   = frontend_info.get('build_tool', 'vite')
+    raw_node     = str(frontend_info.get('node_version') or '20').lstrip('v')
+    node_version = raw_node.split('.')[0]   # keep only major
+    api_proxy    = frontend_info.get('api_proxy') or []
+    frontend_root = frontend_info['root']
+
+    service_name = 'frontend'
+    service_dir  = os.path.join(output_path, service_name)
+    os.makedirs(service_dir, exist_ok=True)
+
+    for item in os.listdir(frontend_root):
+        if item in _FRONTEND_SKIP:
+            continue
+        src = os.path.join(frontend_root, item)
+        dst = os.path.join(service_dir, item)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+
+    dockerfile = template_env.get_template('Dockerfile.frontend.jinja2').render(
+        framework=framework,
+        build_tool=build_tool,
+        node_version=node_version,
+        dev_port=80,        # nginx listens on 80 in the container
+        service_name=service_name,
+        api_proxy=[],       # gateway handles routing; no inline proxy needed
+    )
+    with open(os.path.join(service_dir, 'Dockerfile'), 'w') as f:
+        f.write(dockerfile)
+
+    print(f"🌐 [FRONTEND] {service_name} → {framework}/{build_tool}  port=80")
+    return {'name': service_name, 'port': 80, 'type': 'frontend', 'url_prefix': '/'}
+
 
 def render_service(module_info, all_modules, all_deps_map, output_path,
                    template_env, source_path, framework='flask'):
@@ -200,79 +279,102 @@ def run_generation(source_path=None, output_path=None):
 
     # 1. СКАНИРОВАНИЕ
     scan_result = scanner.scan_project_structure(source_path)
+    language     = scan_result.get('language', 'python')
     all_deps_map = scan_result.get('dependencies', {})
-
-    all_modules = scan_result.get('modules', [])
-    runnable_services = [m for m in all_modules if m.get('type') == 'service']
-    shared_libs = [m for m in all_modules if m.get('type') == 'shared']
+    all_modules  = scan_result.get('modules', [])
 
     env = Environment(loader=FileSystemLoader(templates_dir))
+    generated_services = []   # unified list passed to nginx/compose templates
 
-    # 2. ОПРЕДЕЛЕНИЕ ФРЕЙМВОРКА
-    framework = scanner.detect_framework(source_path, all_deps_map.get('.', []))
-    print(f"🔧 [FRAMEWORK] Обнаружен: {framework}")
+    # 2. ГЕНЕРАЦИЯ БЭКЕНДА
+    if language == 'java':
+        # ── Java / Spring Boot ────────────────────────────────────────────────
+        java_svc = generate_java_service(scan_result, output_path, env)
+        generated_services.append(java_svc)
 
-    # 3. ГЕНЕРАЦИЯ СЕРВИСОВ
-    for module in runnable_services:
-        try:
-            render_service(module, all_modules, all_deps_map, output_path,
-                           env, source_path, framework)
-        except Exception as e:
-            print(f"❌ Ошибка генерации сервиса {module['name']}: {e}")
+    else:
+        # ── Python (Flask / FastAPI / Django) ─────────────────────────────────
+        runnable_services = [m for m in all_modules if m.get('type') == 'service']
+        shared_libs       = [m for m in all_modules if m.get('type') == 'shared']
 
-    # 4. КОПИРОВАНИЕ ОБЩИХ РЕСУРСОВ
-    for service in runnable_services:
-        service_dir = os.path.join(output_path, service['name'])
+        framework = scanner.detect_framework(source_path, all_deps_map.get('.', []))
+        print(f"🔧 [FRAMEWORK] Обнаружен: {framework}")
 
-        db_dest = os.path.join(service_dir, 'db.py')
-        db_src = os.path.join(source_path, 'db.py')
-        if os.path.exists(db_src):
-            shutil.copy(db_src, db_dest)
-        elif not os.path.exists(db_dest):
-            with open(db_dest, 'w') as f:
-                f.write("from flask_sqlalchemy import SQLAlchemy\ndb = SQLAlchemy()\n")
+        for module in runnable_services:
+            try:
+                render_service(module, all_modules, all_deps_map, output_path,
+                               env, source_path, framework)
+                generated_services.append({
+                    'name':       module['name'],
+                    'port':       5000,
+                    'type':       'python',
+                    'url_prefix': module.get('url_prefix') or f'/{module["name"]}',
+                })
+            except Exception as e:
+                print(f"❌ Ошибка генерации сервиса {module['name']}: {e}")
 
-        for shared in shared_libs:
-            if shared.get('is_root_file'):
-                continue  # root .py files are copied by the loop below
-            shared_src = os.path.join(source_path, shared['path'])
-            if os.path.exists(shared_src) and os.path.isdir(shared_src):
-                shutil.copytree(shared_src, os.path.join(service_dir, shared['name']), dirs_exist_ok=True)
+        # 3. КОПИРОВАНИЕ ОБЩИХ РЕСУРСОВ
+        for service in runnable_services:
+            service_dir = os.path.join(output_path, service['name'])
 
-        # Копируем глобальные templates/ и static/ из корня монолита
-        for root_resource in ('templates', 'static'):
-            resource_src = os.path.join(source_path, root_resource)
-            if os.path.exists(resource_src):
-                resource_dst = os.path.join(service_dir, root_resource)
-                shutil.copytree(resource_src, resource_dst, dirs_exist_ok=True)
+            db_dest = os.path.join(service_dir, 'db.py')
+            db_src  = os.path.join(source_path, 'db.py')
+            if os.path.exists(db_src):
+                shutil.copy(db_src, db_dest)
+            elif not os.path.exists(db_dest):
+                with open(db_dest, 'w') as f:
+                    f.write("from flask_sqlalchemy import SQLAlchemy\ndb = SQLAlchemy()\n")
 
-        # Копируем корневые .py файлы (models.py, config.py, extensions.py и т.д.)
-        for fname in os.listdir(source_path):
-            if not fname.endswith('.py'):
-                continue
-            if fname in _SKIP_ROOT_FILES:
-                continue
-            src_file = os.path.join(source_path, fname)
-            if not os.path.isfile(src_file):
-                continue
-            dst_file = os.path.join(service_dir, fname)
-            if not os.path.exists(dst_file):
-                shutil.copy(src_file, dst_file)
+            for shared in shared_libs:
+                if shared.get('is_root_file'):
+                    continue
+                shared_src = os.path.join(source_path, shared['path'])
+                if os.path.exists(shared_src) and os.path.isdir(shared_src):
+                    shutil.copytree(shared_src, os.path.join(service_dir, shared['name']),
+                                    dirs_exist_ok=True)
 
-    # 5. АНАЛИЗ ГРАФА ЗАВИСИМОСТЕЙ
-    scan_result['import_edges'] = scanner.analyze_import_graph(source_path, all_modules)
+            for root_resource in ('templates', 'static'):
+                resource_src = os.path.join(source_path, root_resource)
+                if os.path.exists(resource_src):
+                    shutil.copytree(resource_src, os.path.join(service_dir, root_resource),
+                                    dirs_exist_ok=True)
+
+            for fname in os.listdir(source_path):
+                if not fname.endswith('.py') or fname in _SKIP_ROOT_FILES:
+                    continue
+                src_file = os.path.join(source_path, fname)
+                if not os.path.isfile(src_file):
+                    continue
+                dst_file = os.path.join(service_dir, fname)
+                if not os.path.exists(dst_file):
+                    shutil.copy(src_file, dst_file)
+
+        # 4. АНАЛИЗ ГРАФА ЗАВИСИМОСТЕЙ
+        scan_result['import_edges'] = scanner.analyze_import_graph(source_path, all_modules)
+
+    # 5. ГЕНЕРАЦИЯ ФРОНТЕНДА (работает для любого типа бэкенда)
+    frontend_info = scan_result.get('frontend')
+    if frontend_info:
+        fe_svc = generate_frontend_service(frontend_info, output_path, env)
+        generated_services.append(fe_svc)
+
+    # Если фронтенд есть — Java-бэкенд использует /api, иначе /
+    has_frontend_svc = any(s['type'] == 'frontend' for s in generated_services)
+    for svc in generated_services:
+        if svc['type'] == 'java':
+            svc['url_prefix'] = '/api' if has_frontend_svc else '/'
 
     # 6. ГЕНЕРАЦИЯ API GATEWAY (NGINX)
-    print(" Генерация API Gateway (Nginx)...")
+    print("🔀 Генерация API Gateway (Nginx)...")
     nginx_dir = os.path.join(output_path, "nginx")
     os.makedirs(nginx_dir, exist_ok=True)
-    nginx_content = env.get_template("nginx.conf.jinja2").render(services=runnable_services)
+    nginx_content = env.get_template("nginx.conf.jinja2").render(services=generated_services)
     with open(os.path.join(nginx_dir, "nginx.conf"), "w") as f:
         f.write(nginx_content)
 
     # 7. ГЕНЕРАЦИЯ .env С СЛУЧАЙНЫМ ПАРОЛЕМ
     pg_password = generate_password()
-    secret_key = generate_password(32)
+    secret_key  = generate_password(32)
     env_content = (
         "POSTGRES_USER=admin\n"
         f"POSTGRES_PASSWORD={pg_password}\n"
@@ -283,15 +385,13 @@ def run_generation(source_path=None, output_path=None):
     with open(env_path, "w") as f:
         f.write(env_content)
 
-    example_content = (
-        "POSTGRES_USER=admin\n"
-        "POSTGRES_PASSWORD=<your-secure-password>\n"
-        "POSTGRES_DB=microservices_db\n"
-        "SECRET_KEY=<your-secret-key>\n"
-    )
     with open(os.path.join(output_path, ".env.example"), "w") as f:
-        f.write(example_content)
-
+        f.write(
+            "POSTGRES_USER=admin\n"
+            "POSTGRES_PASSWORD=<your-secure-password>\n"
+            "POSTGRES_DB=microservices_db\n"
+            "SECRET_KEY=<your-secret-key>\n"
+        )
     print(f"🔐 Сгенерирован случайный пароль БД → {env_path}")
 
     # 8. КОНФИГИ ЛОГИРОВАНИЯ (Promtail + Grafana)
@@ -304,7 +404,10 @@ def run_generation(source_path=None, output_path=None):
     print("📊 Конфиги Loki/Promtail/Grafana сгенерированы → logging/")
 
     # 9. DOCKER COMPOSE
-    compose_content = env.get_template("docker-compose.jinja2").render(services=runnable_services)
+    compose_content = env.get_template("docker-compose.jinja2").render(
+        services=generated_services,
+        language=language,
+    )
     with open(os.path.join(output_path, "docker-compose.yaml"), "w") as f:
         f.write(compose_content)
 
